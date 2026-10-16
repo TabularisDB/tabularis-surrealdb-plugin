@@ -141,6 +141,11 @@ pub fn with_hint(message: &str, config: &SessionConfig, signed_in_as: AuthLevel)
             "{message}. Set the Database field to `namespace/database`, or select a database in the explorer."
         );
     }
+    if lower.contains("timed out") || lower.contains("timeout") {
+        return format!(
+            "{message} (the statement ran past its TIMEOUT and the server failed it; paged SELECTs get a TIMEOUT from the plugin's query timeout setting)"
+        );
+    }
     if lower.contains("expired") {
         return format!("{message}. Reconnect to sign in again.");
     }

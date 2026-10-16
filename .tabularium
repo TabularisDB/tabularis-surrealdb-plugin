@@ -38,6 +38,15 @@
     "explain": false,
     "supports_ssl": true
   },
+  "settings": [
+    {
+      "key": "query_timeout_seconds",
+      "label": "Query timeout (seconds)",
+      "type": "number",
+      "default": 0,
+      "description": "Stop waiting for a query after this many seconds and report it. Paged SELECTs also get a SurrealQL TIMEOUT, so the server fails them at that point too. 0 disables it."
+    }
+  ],
   "data_types": [
     { "name": "any", "category": "other", "requires_length": false, "requires_precision": false },
     { "name": "bool", "category": "boolean", "requires_length": false, "requires_precision": false },

@@ -22,6 +22,29 @@ pub enum StatementOutcome {
     Err(String),
 }
 
+/// A statement outcome with the server-side execution time it reported.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimedOutcome {
+    pub outcome: StatementOutcome,
+    pub time_ms: Option<f64>,
+}
+
+impl TimedOutcome {
+    pub fn ok(value: Cbor) -> Self {
+        Self {
+            outcome: StatementOutcome::Ok(value),
+            time_ms: None,
+        }
+    }
+
+    pub fn err(message: impl Into<String>) -> Self {
+        Self {
+            outcome: StatementOutcome::Err(message.into()),
+            time_ms: None,
+        }
+    }
+}
+
 pub struct Session {
     client: RpcClient,
     pub config: SessionConfig,
@@ -111,7 +134,7 @@ impl Session {
     /// key, so the caller cannot tell either way.
     async fn info_names(&self, sql: &str, key: &str) -> Result<Option<Vec<String>>, PluginError> {
         let info = match self.query(sql, vec![]).await {
-            Ok(outcomes) => match outcomes.into_iter().next() {
+            Ok(outcomes) => match outcomes.into_iter().next().map(|timed| timed.outcome) {
                 Some(StatementOutcome::Ok(info)) => info,
                 Some(StatementOutcome::Err(m)) if errors::is_permission_denied(&m) => {
                     return Ok(None)
@@ -163,7 +186,7 @@ impl Session {
         &self,
         sql: &str,
         vars: Vec<(&str, Cbor)>,
-    ) -> Result<Vec<StatementOutcome>, RpcError> {
+    ) -> Result<Vec<TimedOutcome>, RpcError> {
         let vars = Cbor::Map(
             vars.into_iter()
                 .map(|(k, v)| (Cbor::Text(k.to_string()), v))
@@ -181,7 +204,7 @@ impl Session {
         &self,
         sql: &str,
         vars: Vec<(&str, Cbor)>,
-    ) -> Result<Vec<StatementOutcome>, PluginError> {
+    ) -> Result<Vec<TimedOutcome>, PluginError> {
         self.query(sql, vars).await.map_err(|e| self.rpc_error(e))
     }
 
@@ -195,7 +218,7 @@ impl Session {
         self.query_checked(sql, vars)
             .await?
             .into_iter()
-            .map(|outcome| match outcome {
+            .map(|timed| match timed.outcome {
                 StatementOutcome::Ok(v) => Ok(v),
                 StatementOutcome::Err(m) => Err(PluginError::internal(self.hint(&m))),
             })
@@ -327,7 +350,7 @@ pub fn signin_params(config: &SessionConfig, level: AuthLevel) -> Cbor {
 /// Read the `query` response: an array of `{ status, time, result }`.
 /// For `status: "ERR"` the result is the error message (2.x) or carries it
 /// next to `kind`/`details` (3.x).
-pub fn parse_query_response(response: Cbor) -> Result<Vec<StatementOutcome>, RpcError> {
+pub fn parse_query_response(response: Cbor) -> Result<Vec<TimedOutcome>, RpcError> {
     let Cbor::Array(items) = response else {
         return Err(RpcError::Protocol(
             "query did not return an array".to_string(),
@@ -337,14 +360,16 @@ pub fn parse_query_response(response: Cbor) -> Result<Vec<StatementOutcome>, Rpc
         .into_iter()
         .map(|item| {
             let Cbor::Map(entries) = item else {
-                return StatementOutcome::Ok(item);
+                return TimedOutcome::ok(item);
             };
             let mut status = None;
+            let mut time_ms = None;
             let mut result = Cbor::Tag(crate::utils::values::tags::NONE, Box::new(Cbor::Null));
             for (k, v) in entries {
                 match k.as_text() {
                     Some("status") => status = v.as_text().map(str::to_string),
                     Some("result") => result = v,
+                    Some("time") => time_ms = v.as_text().and_then(parse_duration_ms),
                     _ => {}
                 }
             }
@@ -353,12 +378,35 @@ pub fn parse_query_response(response: Cbor) -> Result<Vec<StatementOutcome>, Rpc
                     Cbor::Text(t) => t,
                     other => crate::utils::values::to_cell(&other).to_string(),
                 };
-                StatementOutcome::Err(message)
+                TimedOutcome {
+                    outcome: StatementOutcome::Err(message),
+                    time_ms,
+                }
             } else {
-                StatementOutcome::Ok(result)
+                TimedOutcome {
+                    outcome: StatementOutcome::Ok(result),
+                    time_ms,
+                }
             }
         })
         .collect())
+}
+
+/// Milliseconds from a statement `time` such as `3.82ms`, `130.3µs`,
+/// `1.5s` or `10ns` (Rust's `Duration` debug format, used by 2.x and 3.x).
+pub fn parse_duration_ms(text: &str) -> Option<f64> {
+    let text = text.trim();
+    let split = text.find(|c: char| !(c.is_ascii_digit() || c == '.'))?;
+    let (number, unit) = text.split_at(split);
+    let value: f64 = number.parse().ok()?;
+    let factor = match unit {
+        "ns" => 1e-6,
+        "µs" | "us" => 1e-3,
+        "ms" => 1.0,
+        "s" => 1e3,
+        _ => return None,
+    };
+    Some(value * factor)
 }
 
 fn version_text(value: &Cbor) -> String {
@@ -440,12 +488,18 @@ mod tests {
             map(vec![("status", Cbor::Text("OK".into()))]),
         ]);
         let out = parse_query_response(response).unwrap();
-        assert_eq!(out[0], StatementOutcome::Ok(Cbor::Integer(1.into())));
         assert_eq!(
-            out[1],
+            out[0].outcome,
+            StatementOutcome::Ok(Cbor::Integer(1.into()))
+        );
+        assert_eq!(
+            out[1].outcome,
             StatementOutcome::Err("The table 'nosuch' does not exist".into())
         );
-        assert!(matches!(&out[2], StatementOutcome::Ok(Cbor::Tag(6, _))));
+        assert!(matches!(
+            &out[2].outcome,
+            StatementOutcome::Ok(Cbor::Tag(6, _))
+        ));
         assert!(parse_query_response(Cbor::Null).is_err());
     }
 
@@ -468,6 +522,26 @@ mod tests {
         assert_eq!(
             timeout_error("selecting `app/main`").message,
             "SurrealDB did not answer within 15s while selecting `app/main`."
+        );
+    }
+
+    #[test]
+    fn parses_statement_times() {
+        let close = |a: Option<f64>, b: f64| (a.unwrap() - b).abs() < 1e-9;
+        assert!(close(parse_duration_ms("3.822666ms"), 3.822666));
+        assert!(close(parse_duration_ms("130.333µs"), 0.130333));
+        assert!(close(parse_duration_ms("1.5s"), 1500.0));
+        assert!(close(parse_duration_ms("10ns"), 0.00001));
+        assert_eq!(parse_duration_ms("soon"), None);
+        assert_eq!(parse_duration_ms("1h"), None);
+        let response = Cbor::Array(vec![map(vec![
+            ("status", Cbor::Text("OK".into())),
+            ("time", Cbor::Text("2ms".into())),
+            ("result", Cbor::Null),
+        ])]);
+        assert_eq!(
+            parse_query_response(response).unwrap()[0].time_ms,
+            Some(2.0)
         );
     }
 

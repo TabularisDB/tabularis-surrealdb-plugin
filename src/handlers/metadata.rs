@@ -36,7 +36,7 @@ pub async fn query_ok(
         .map_err(|e| retry_class(session, e))?;
     outcomes
         .into_iter()
-        .map(|o| match o {
+        .map(|timed| match timed.outcome {
             StatementOutcome::Ok(v) => Ok(v),
             StatementOutcome::Err(m) => Err(Retry::Final(PluginError::internal(session.hint(&m)))),
         })

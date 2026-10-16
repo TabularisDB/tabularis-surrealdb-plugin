@@ -22,11 +22,12 @@ pub struct TopLevelWord {
     pub range: Range<usize>,
 }
 
-/// One scanned statement: its byte range in the source and its top-level
-/// words in order.
+/// One scanned statement: its text, its byte range in the source, and its
+/// top-level words in order (ranges relative to `text`).
 #[derive(Debug, Clone)]
 pub struct Statement<'a> {
     pub text: &'a str,
+    pub range: Range<usize>,
     pub words: Vec<TopLevelWord>,
 }
 
@@ -97,7 +98,11 @@ fn push_statement<'a>(
             range: (w.range.start - offset)..(w.range.end - offset),
         })
         .collect();
-    out.push(Statement { text, words });
+    out.push(Statement {
+        text,
+        range: offset..offset + text.len(),
+        words,
+    });
 }
 
 /// Keywords that, when present at the top level of a SELECT, mean the plugin
@@ -122,11 +127,20 @@ pub fn can_push_down_pagination(statement: &Statement<'_>) -> bool {
             .any(|k| statement.has_top_level_keyword(k))
 }
 
-/// Append a pagination clause. The caller checks
+/// Append a pagination clause, and a `TIMEOUT` when one is configured (it
+/// follows `START` in the SELECT grammar). The caller checks
 /// [`can_push_down_pagination`] first. The clause goes on a new line so a
 /// trailing `--` comment cannot swallow it.
-pub fn with_pagination(statement: &str, limit: u64, start: u64) -> String {
-    format!("{statement}\nLIMIT {limit} START {start}")
+pub fn with_pagination(
+    statement: &str,
+    limit: u64,
+    start: u64,
+    timeout_secs: Option<u64>,
+) -> String {
+    match timeout_secs {
+        Some(t) => format!("{statement}\nLIMIT {limit} START {start} TIMEOUT {t}s"),
+        None => format!("{statement}\nLIMIT {limit} START {start}"),
+    }
 }
 
 /// Undo the two places where the host's generic table-browse SQL is not
@@ -441,13 +455,13 @@ mod tests {
     #[test]
     fn appends_limit_then_start() {
         assert_eq!(
-            with_pagination("SELECT * FROM `person`", 101, 200),
+            with_pagination("SELECT * FROM `person`", 101, 200, None),
             "SELECT * FROM `person`\nLIMIT 101 START 200"
         );
         let stmt = &split_statements("SELECT * FROM person -- newest first")[0];
         assert!(can_push_down_pagination(stmt));
         assert_eq!(
-            with_pagination(stmt.text, 2, 0),
+            with_pagination(stmt.text, 2, 0, None),
             "SELECT * FROM person -- newest first\nLIMIT 2 START 0"
         );
     }
@@ -483,6 +497,22 @@ mod tests {
             ),
             "SELECT * FROM (SELECT * FROM `a\\`b` LIMIT 2)"
         );
+    }
+
+    #[test]
+    fn appends_a_timeout_after_start() {
+        assert_eq!(
+            with_pagination("SELECT * FROM t", 11, 0, Some(30)),
+            "SELECT * FROM t\nLIMIT 11 START 0 TIMEOUT 30s"
+        );
+    }
+
+    #[test]
+    fn statement_ranges_point_into_the_source() {
+        let sql = "  RETURN 1 ;\n SELECT * FROM t";
+        let stmts = split_statements(sql);
+        assert_eq!(&sql[stmts[0].range.clone()], "RETURN 1");
+        assert_eq!(&sql[stmts[1].range.clone()], "SELECT * FROM t");
     }
 
     #[test]

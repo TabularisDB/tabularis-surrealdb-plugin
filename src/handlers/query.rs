@@ -1,17 +1,32 @@
 //! Connection checks and SurrealQL execution.
+//!
+//! Two entry points run SurrealQL:
+//!
+//! - `execute_query`: one query text (a single statement, or a script from
+//!   a notebook cell). Returns one `QueryResult`.
+//! - `execute_query_batch`: the editor's "run all", already split into
+//!   statements by the host. The plugin sends them to SurrealDB as one
+//!   script, so `LET` variables and `BEGIN … COMMIT` work across them, and
+//!   returns one result or error per statement.
+
+use std::time::Duration;
 
 use serde_json::{json, Value as Json};
 
 use crate::error::PluginError;
-use crate::handlers::results::{pagination, query_result, tabulate, tabulate_items, Table};
+use crate::handlers::results::{
+    pagination, query_result, query_result_with, tabulate, tabulate_items, Table,
+};
 use crate::handlers::{req_str, session_config, Context};
 use crate::models::SessionConfig;
-use crate::surreal::session::{Session, StatementOutcome};
+use crate::surreal::session::{Session, StatementOutcome, TimedOutcome};
 use crate::surreal::{retry_class, Retry};
 use crate::utils::pagination::{offset_for, slice_page};
 use crate::utils::surql::{
     can_push_down_pagination, normalize_host_browse_query, split_statements, with_pagination,
+    Statement,
 };
+use crate::utils::values::is_none;
 use ciborium::value::Value as Cbor;
 
 /// Open a fresh session (never a cached one, so the result reflects the
@@ -64,111 +79,236 @@ pub enum PageMode {
     None,
 }
 
+/// What the plugin knows about one statement it sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementPlan {
+    /// First keyword, upper-cased (`SELECT`, `CREATE`, …).
+    pub keyword: Option<String>,
+    pub mode: PageMode,
+}
+
 /// What `execute_query` sends to the server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     pub sql: String,
-    pub mode: PageMode,
+    pub statements: Vec<StatementPlan>,
     /// The query changes namespace/database with `USE`.
     pub uses_use: bool,
-    pub statement_count: usize,
 }
+
+/// Statements whose returned records are the records they changed.
+const WRITE_KEYWORDS: &[&str] = &["CREATE", "INSERT", "UPDATE", "UPSERT", "DELETE", "RELATE"];
 
 /// Decide how to run `query` for page `page` of `limit` rows.
 ///
 /// Only single SELECT statements are paginated: the host re-runs the query
-/// for every page, which must never re-apply a write.
-pub fn plan(query: &str, limit: Option<u64>, page: u64) -> Result<Plan, PluginError> {
+/// for every page, which must never re-apply a write. A configured query
+/// timeout is added to pushed-down SELECTs as a `TIMEOUT` clause, so the
+/// server fails them when it expires.
+pub fn plan(
+    query: &str,
+    limit: Option<u64>,
+    page: u64,
+    timeout_secs: Option<u64>,
+) -> Result<Plan, PluginError> {
     let normalized = normalize_host_browse_query(query);
     let statements = split_statements(&normalized);
     if statements.is_empty() {
         return Err(PluginError::invalid_params("The query is empty."));
     }
     let uses_use = statements.iter().any(|s| s.first_keyword() == Some("USE"));
-    let statement_count = statements.len();
-    let single_select = statement_count == 1 && statements[0].first_keyword() == Some("SELECT");
-    let (sql, mode) = match (single_select, limit) {
-        (true, Some(size)) if can_push_down_pagination(&statements[0]) => {
+    let keyword = |s: &Statement<'_>| s.first_keyword().map(str::to_string);
+    if statements.len() == 1 {
+        let (sql, mode) = single_statement(&statements[0], limit, page, timeout_secs);
+        return Ok(Plan {
+            sql,
+            statements: vec![StatementPlan {
+                keyword: keyword(&statements[0]),
+                mode,
+            }],
+            uses_use,
+        });
+    }
+    Ok(Plan {
+        sql: normalized.clone(),
+        statements: statements
+            .iter()
+            .map(|s| StatementPlan {
+                keyword: keyword(s),
+                mode: PageMode::None,
+            })
+            .collect(),
+        uses_use,
+    })
+}
+
+fn single_statement(
+    statement: &Statement<'_>,
+    limit: Option<u64>,
+    page: u64,
+    timeout_secs: Option<u64>,
+) -> (String, PageMode) {
+    match (statement.first_keyword() == Some("SELECT"), limit) {
+        (true, Some(size)) if can_push_down_pagination(statement) => {
             let offset = offset_for(page, size);
             (
-                with_pagination(statements[0].text, size.saturating_add(1), offset),
+                with_pagination(statement.text, size.saturating_add(1), offset, timeout_secs),
                 PageMode::PushDown { page, size },
             )
         }
-        (true, Some(size)) => (
-            statements[0].text.to_string(),
-            PageMode::Slice { page, size },
-        ),
-        _ => (normalized.clone(), PageMode::None),
-    };
-    Ok(Plan {
-        sql,
-        mode,
-        uses_use,
-        statement_count,
-    })
+        (true, Some(size)) => (statement.text.to_string(), PageMode::Slice { page, size }),
+        _ => (statement.text.to_string(), PageMode::None),
+    }
+}
+
+fn limit_param(params: &Json) -> Option<u64> {
+    params
+        .get("limit")
+        .or_else(|| params.get("page_size"))
+        .and_then(Json::as_u64)
+        .filter(|l| *l > 0)
 }
 
 pub async fn execute_query(ctx: &Context, params: &Json) -> Result<Json, PluginError> {
     let config = session_config(params)?;
     let query = req_str(params, "query")?;
-    let limit = params
-        .get("limit")
-        .or_else(|| params.get("page_size"))
-        .and_then(Json::as_u64)
-        .filter(|l| *l > 0);
     let page = params.get("page").and_then(Json::as_u64).unwrap_or(1);
-    let plan = plan(query, limit, page)?;
+    let timeout = ctx.settings().query_timeout_secs;
+    let plan = plan(query, limit_param(params), page, timeout)?;
+    let outcomes = run(ctx, &config, &plan.sql, plan.uses_use, timeout).await?;
+    build_response(outcomes, &plan.statements)
+}
 
-    let outcomes = if plan.uses_use || config.connection_id.is_none() {
-        // `USE` would switch the shared session's namespace/database under
-        // concurrent requests; give such queries a session of their own.
-        let session = Session::open(&SessionConfig {
-            connection_id: None,
-            ..config.clone()
-        })
-        .await?;
-        let outcomes = session.query_checked(&plan.sql, vec![]).await?;
-        with_hints(&session, outcomes)
-    } else {
-        let sql = plan.sql.clone();
-        ctx.sessions
-            .with_session(&config, |session| {
-                let sql = sql.clone();
-                async move {
-                    let outcomes = session
-                        .query(&sql, vec![])
-                        .await
-                        .map_err(|e| retry_class(&session, e))?;
-                    Ok(with_hints(&session, outcomes))
-                }
+/// Send SurrealQL and return one outcome per statement, with hints added to
+/// statement errors. A query with `USE` runs on a session of its own, since
+/// `USE` would switch the shared session's namespace/database under
+/// concurrent requests. With a query timeout set, the plugin stops waiting
+/// after it (plus a second, so a server-side `TIMEOUT` reports first).
+async fn run(
+    ctx: &Context,
+    config: &SessionConfig,
+    sql: &str,
+    uses_use: bool,
+    timeout_secs: Option<u64>,
+) -> Result<Vec<TimedOutcome>, PluginError> {
+    let work = async {
+        if uses_use || config.connection_id.is_none() {
+            let session = Session::open(&SessionConfig {
+                connection_id: None,
+                ..config.clone()
             })
-            .await?
+            .await?;
+            let outcomes = session.query_checked(sql, vec![]).await?;
+            Ok(with_hints(&session, outcomes))
+        } else {
+            ctx.sessions
+                .with_session(config, |session| {
+                    let sql = sql.to_string();
+                    async move {
+                        let outcomes = session
+                            .query(&sql, vec![])
+                            .await
+                            .map_err(|e| retry_class(&session, e))?;
+                        Ok(with_hints(&session, outcomes))
+                    }
+                })
+                .await
+        }
     };
-    build_response(outcomes, plan.mode)
+    match timeout_secs {
+        None => work.await,
+        Some(secs) => {
+            tokio::time::timeout(Duration::from_secs(secs) + Duration::from_secs(1), work)
+                .await
+                .map_err(|_| local_timeout_error(secs))?
+        }
+    }
+}
+
+pub fn local_timeout_error(secs: u64) -> PluginError {
+    PluginError::internal(format!(
+        "SurrealDB did not answer within the plugin's query timeout ({secs}s). The plugin stopped waiting, but the statement may still be running on the server. Raise or disable it in the SurrealDB plugin settings, or add a TIMEOUT clause to the statement."
+    ))
 }
 
 /// Add hints (which need the signed-in level) to statement errors.
-fn with_hints(session: &Session, outcomes: Vec<StatementOutcome>) -> Vec<StatementOutcome> {
+fn with_hints(session: &Session, outcomes: Vec<TimedOutcome>) -> Vec<TimedOutcome> {
     outcomes
         .into_iter()
-        .map(|o| match o {
-            StatementOutcome::Err(m) => StatementOutcome::Err(session.hint(&m)),
-            ok => ok,
+        .map(|t| match t.outcome {
+            StatementOutcome::Err(m) => TimedOutcome {
+                outcome: StatementOutcome::Err(session.hint(&m)),
+                time_ms: t.time_ms,
+            },
+            ok => TimedOutcome {
+                outcome: ok,
+                time_ms: t.time_ms,
+            },
         })
         .collect()
 }
 
-/// Turn statement outcomes into the host's `QueryResult`.
+/// One statement's value as a `QueryResult`, with paging, an affected-row
+/// count for writes (the records the statement returned) and the server
+/// time.
+fn statement_result(value: Cbor, plan: Option<&StatementPlan>, time_ms: Option<f64>) -> Json {
+    let mode = plan.map(|p| p.mode).unwrap_or(PageMode::None);
+    let is_write = plan
+        .and_then(|p| p.keyword.as_deref())
+        .is_some_and(|k| WRITE_KEYWORDS.contains(&k));
+    match (mode, value) {
+        (PageMode::PushDown { page, size }, Cbor::Array(mut items)) => {
+            let has_more = items.len() as u64 > size;
+            items.truncate(usize::try_from(size).unwrap_or(usize::MAX));
+            query_result_with(
+                tabulate_items(&items),
+                Some(pagination(page, size, has_more)),
+                0,
+                time_ms,
+            )
+        }
+        (PageMode::Slice { page, size }, Cbor::Array(items)) => {
+            let (items, has_more) = slice_page(items, offset_for(page, size), size);
+            query_result_with(
+                tabulate_items(&items),
+                Some(pagination(page, size, has_more)),
+                0,
+                time_ms,
+            )
+        }
+        (_, other) => {
+            let affected = match (&other, is_write) {
+                (Cbor::Array(items), true) => items.len() as u64,
+                (Cbor::Map(_), true) => 1,
+                _ => 0,
+            };
+            query_result_with(tabulate(&other), None, affected, time_ms)
+        }
+    }
+}
+
+/// Turn the outcomes of one `execute_query` call into a `QueryResult`.
+///
+/// - A failed statement fails the call, naming the statement when there are
+///   several (the host has one error slot per call).
+/// - With several statements, the ones that return nothing (NONE: `LET`,
+///   `DEFINE`, `USE`, `BEGIN`, …) produce no result set. The first remaining
+///   result is the primary one, which is what a notebook cell shows; the
+///   rest go to `additional_results` (result tabs in the editor).
 pub fn build_response(
-    outcomes: Vec<StatementOutcome>,
-    mode: PageMode,
+    outcomes: Vec<TimedOutcome>,
+    plans: &[StatementPlan],
 ) -> Result<Json, PluginError> {
     let total = outcomes.len();
-    if let Some((index, message)) = outcomes.iter().enumerate().find_map(|(i, o)| match o {
-        StatementOutcome::Err(m) => Some((i, m.clone())),
-        StatementOutcome::Ok(_) => None,
-    }) {
+    if let Some((index, message)) =
+        outcomes
+            .iter()
+            .enumerate()
+            .find_map(|(i, t)| match &t.outcome {
+                StatementOutcome::Err(m) => Some((i, m.clone())),
+                StatementOutcome::Ok(_) => None,
+            })
+    {
         return Err(PluginError::internal(if total == 1 {
             message
         } else {
@@ -178,14 +318,21 @@ pub fn build_response(
             )
         }));
     }
-    let mut values: Vec<Cbor> = outcomes
-        .into_iter()
-        .map(|o| match o {
-            StatementOutcome::Ok(v) => v,
-            StatementOutcome::Err(_) => unreachable!("errors returned above"),
-        })
-        .collect();
-    if values.is_empty() {
+    // Plans line up with outcomes when the plugin's statement count matches
+    // the server's; otherwise run without per-statement knowledge.
+    let aligned = plans.len() == total;
+    let mut results: Vec<Json> = Vec::new();
+    for (i, timed) in outcomes.into_iter().enumerate() {
+        let StatementOutcome::Ok(value) = timed.outcome else {
+            unreachable!("errors returned above")
+        };
+        if total > 1 && is_none(&value) {
+            continue;
+        }
+        let plan = if aligned { plans.get(i) } else { None };
+        results.push(statement_result(value, plan, timed.time_ms));
+    }
+    if results.is_empty() {
         return Ok(query_result(
             Table {
                 columns: vec![],
@@ -194,36 +341,173 @@ pub fn build_response(
             None,
         ));
     }
-
-    let first = values.remove(0);
-    let primary = match (mode, first) {
-        (PageMode::PushDown { page, size }, Cbor::Array(mut items)) => {
-            let has_more = items.len() as u64 > size;
-            items.truncate(usize::try_from(size).unwrap_or(usize::MAX));
-            query_result(
-                tabulate_items(&items),
-                Some(pagination(page, size, has_more)),
-            )
-        }
-        (PageMode::Slice { page, size }, Cbor::Array(items)) => {
-            let (items, has_more) = slice_page(items, offset_for(page, size), size);
-            query_result(
-                tabulate_items(&items),
-                Some(pagination(page, size, has_more)),
-            )
-        }
-        (_, other) => query_result(tabulate(&other), None),
-    };
-    if values.is_empty() {
-        return Ok(primary);
+    let mut primary = results.remove(0);
+    if !results.is_empty() {
+        primary["additional_results"] = Json::Array(results);
     }
-    let mut primary = primary;
-    let additional: Vec<Json> = values
-        .iter()
-        .map(|v| query_result(tabulate(v), None))
-        .collect();
-    primary["additional_results"] = Json::Array(additional);
     Ok(primary)
+}
+
+// ---------------------------------------------------------------------------
+// execute_query_batch
+// ---------------------------------------------------------------------------
+
+/// One entry of the host's batch after planning.
+struct BatchEntry {
+    /// Text sent to the server, or `None` for a comment-only entry.
+    sql: Option<String>,
+    plans: Vec<StatementPlan>,
+    /// Byte range of `sql` inside the joined script.
+    range: std::ops::Range<usize>,
+}
+
+pub async fn execute_query_batch(ctx: &Context, params: &Json) -> Result<Json, PluginError> {
+    let config = session_config(params)?;
+    let queries: Vec<String> = params
+        .get("queries")
+        .and_then(Json::as_array)
+        .ok_or_else(|| PluginError::invalid_params("missing array parameter `queries`"))?
+        .iter()
+        .map(|q| q.as_str().unwrap_or_default().to_string())
+        .collect();
+    let page = params.get("page").and_then(Json::as_u64).unwrap_or(1);
+    let timeout = ctx.settings().query_timeout_secs;
+    let (script, entries, uses_use) = plan_batch(&queries, limit_param(params), page, timeout);
+
+    if script.trim().is_empty() {
+        return Ok(Json::Array(entries.iter().map(|_| empty_entry()).collect()));
+    }
+    let outcomes = match run(ctx, &config, &script, uses_use, timeout).await {
+        Ok(outcomes) => outcomes,
+        // The whole script was rejected (parse error, timeout, connection):
+        // every statement reports it.
+        Err(e) => return Ok(Json::Array(
+            entries
+                .iter()
+                .map(|_| json!({ "result": null, "error": e.message, "execution_time_ms": null }))
+                .collect(),
+        )),
+    };
+    Ok(Json::Array(assign_batch_outcomes(
+        &script, &entries, outcomes,
+    )))
+}
+
+/// Plan every entry and join them into one script.
+fn plan_batch(
+    queries: &[String],
+    limit: Option<u64>,
+    page: u64,
+    timeout_secs: Option<u64>,
+) -> (String, Vec<BatchEntry>, bool) {
+    let mut script = String::new();
+    let mut entries = Vec::with_capacity(queries.len());
+    let mut uses_use = false;
+    for query in queries {
+        let normalized = normalize_host_browse_query(query);
+        let statements = split_statements(&normalized);
+        if statements.is_empty() {
+            entries.push(BatchEntry {
+                sql: None,
+                plans: vec![],
+                range: script.len()..script.len(),
+            });
+            continue;
+        }
+        uses_use |= statements.iter().any(|s| s.first_keyword() == Some("USE"));
+        let (sql, plans) = if statements.len() == 1 {
+            let (sql, mode) = single_statement(&statements[0], limit, page, timeout_secs);
+            (
+                sql,
+                vec![StatementPlan {
+                    keyword: statements[0].first_keyword().map(str::to_string),
+                    mode,
+                }],
+            )
+        } else {
+            (
+                normalized.clone(),
+                statements
+                    .iter()
+                    .map(|s| StatementPlan {
+                        keyword: s.first_keyword().map(str::to_string),
+                        mode: PageMode::None,
+                    })
+                    .collect(),
+            )
+        };
+        if !script.is_empty() {
+            script.push_str(";\n");
+        }
+        let start = script.len();
+        script.push_str(&sql);
+        entries.push(BatchEntry {
+            sql: Some(sql),
+            plans,
+            range: start..script.len(),
+        });
+    }
+    (script, entries, uses_use)
+}
+
+fn empty_entry() -> Json {
+    json!({
+        "result": query_result(Table { columns: vec![], rows: vec![] }, None),
+        "error": null,
+        "execution_time_ms": null,
+    })
+}
+
+/// Give each host entry the outcomes of the statements that end inside it.
+///
+/// The host splits scripts with a generic SQL splitter, which can cut a
+/// SurrealQL block (`{ …; … }`) into several entries. Joined again, the
+/// block is one statement for the server; its result goes to the entry
+/// where it ends and the other pieces report an empty result.
+fn assign_batch_outcomes(
+    script: &str,
+    entries: &[BatchEntry],
+    outcomes: Vec<TimedOutcome>,
+) -> Vec<Json> {
+    let statements = split_statements(script);
+    let mut per_entry: Vec<Vec<TimedOutcome>> = entries.iter().map(|_| Vec::new()).collect();
+    let sent: Vec<usize> = (0..entries.len())
+        .filter(|i| entries[*i].sql.is_some())
+        .collect();
+    if statements.len() == outcomes.len() {
+        for (statement, outcome) in statements.iter().zip(outcomes) {
+            let end = statement.range.end.saturating_sub(1);
+            let target = sent
+                .iter()
+                .copied()
+                .find(|i| entries[*i].range.contains(&end))
+                .or_else(|| sent.last().copied());
+            if let Some(i) = target {
+                per_entry[i].push(outcome);
+            }
+        }
+    } else if sent.len() == outcomes.len() {
+        for (i, outcome) in sent.iter().zip(outcomes) {
+            per_entry[*i].push(outcome);
+        }
+    } else if let Some(last) = sent.last() {
+        per_entry[*last] = outcomes;
+    }
+
+    entries
+        .iter()
+        .zip(per_entry)
+        .map(|(entry, outcomes)| {
+            if outcomes.is_empty() {
+                return empty_entry();
+            }
+            let time: Option<f64> = outcomes.iter().map(|o| o.time_ms).sum::<Option<f64>>();
+            match build_response(outcomes, &entry.plans) {
+                Ok(result) => json!({ "result": result, "error": null, "execution_time_ms": time }),
+                Err(e) => json!({ "result": null, "error": e.message, "execution_time_ms": time }),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -231,17 +515,38 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn ok(v: Cbor) -> TimedOutcome {
+        TimedOutcome::ok(v)
+    }
+    fn none() -> Cbor {
+        Cbor::Tag(6, Box::new(Cbor::Null))
+    }
+    fn records(n: i64) -> Cbor {
+        Cbor::Array(
+            (0..n)
+                .map(|i| Cbor::Map(vec![(Cbor::Text("n".into()), Cbor::Integer(i.into()))]))
+                .collect(),
+        )
+    }
+    fn plans_for(sql: &str) -> Vec<StatementPlan> {
+        plan(sql, None, 1, None).unwrap().statements
+    }
+
     #[test]
     fn plans_browse_queries_with_push_down() {
-        let p = plan("SELECT * FROM `person`", Some(100), 3).unwrap();
+        let p = plan("SELECT * FROM `person`", Some(100), 3, None).unwrap();
         assert_eq!(p.sql, "SELECT * FROM `person`\nLIMIT 101 START 200");
-        assert_eq!(p.mode, PageMode::PushDown { page: 3, size: 100 });
+        assert_eq!(
+            p.statements[0].mode,
+            PageMode::PushDown { page: 3, size: 100 }
+        );
         assert!(!p.uses_use);
 
         let p = plan(
             "SELECT * FROM (SELECT * FROM `person` LIMIT 50) AS limited_subset",
             Some(20),
             1,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -251,101 +556,198 @@ mod tests {
     }
 
     #[test]
+    fn query_timeout_becomes_a_server_side_timeout_on_paged_selects() {
+        let p = plan("SELECT * FROM `person`", Some(10), 1, Some(30)).unwrap();
+        assert_eq!(
+            p.sql,
+            "SELECT * FROM `person`\nLIMIT 11 START 0 TIMEOUT 30s"
+        );
+        // Other statements are not rewritten.
+        let p = plan("UPDATE person SET a = 1", Some(10), 1, Some(30)).unwrap();
+        assert_eq!(p.sql, "UPDATE person SET a = 1");
+        assert!(local_timeout_error(30).message.contains("30s"));
+    }
+
+    #[test]
     fn plans_selects_that_already_paginate_as_slices() {
-        let p = plan("SELECT * FROM person LIMIT 5;", Some(2), 2).unwrap();
+        let p = plan("SELECT * FROM person LIMIT 5;", Some(2), 2, None).unwrap();
         assert_eq!(p.sql, "SELECT * FROM person LIMIT 5");
-        assert_eq!(p.mode, PageMode::Slice { page: 2, size: 2 });
+        assert_eq!(p.statements[0].mode, PageMode::Slice { page: 2, size: 2 });
     }
 
     #[test]
     fn never_paginates_writes_or_scripts() {
-        let p = plan("UPDATE person SET seen = true", Some(100), 2).unwrap();
-        assert_eq!(p.mode, PageMode::None);
-        assert_eq!(p.sql, "UPDATE person SET seen = true");
-        let p = plan("LET $a = 1; SELECT * FROM person", Some(100), 1).unwrap();
-        assert_eq!(p.mode, PageMode::None);
-        assert_eq!(p.statement_count, 2);
-        let p = plan("SELECT * FROM person", None, 1).unwrap();
-        assert_eq!(p.mode, PageMode::None);
-        let p = plan("USE NS x DB y; SELECT * FROM t", Some(10), 1).unwrap();
+        let p = plan("UPDATE person SET seen = true", Some(100), 2, None).unwrap();
+        assert_eq!(p.statements[0].mode, PageMode::None);
+        let p = plan("LET $a = 1; SELECT * FROM person", Some(100), 1, None).unwrap();
+        assert_eq!(p.statements.len(), 2);
+        assert!(p.statements.iter().all(|s| s.mode == PageMode::None));
+        let p = plan("SELECT * FROM person", None, 1, None).unwrap();
+        assert_eq!(p.statements[0].mode, PageMode::None);
+        let p = plan("USE NS x DB y; SELECT * FROM t", Some(10), 1, None).unwrap();
         assert!(p.uses_use);
-        assert!(plan("  -- nothing\n ; ", Some(10), 1).is_err());
-    }
-
-    fn records(n: i64) -> Cbor {
-        Cbor::Array(
-            (0..n)
-                .map(|i| Cbor::Map(vec![(Cbor::Text("n".into()), Cbor::Integer(i.into()))]))
-                .collect(),
-        )
+        assert!(plan("  -- nothing\n ; ", Some(10), 1, None).is_err());
     }
 
     #[test]
     fn push_down_uses_the_extra_row_for_has_more() {
-        let r = build_response(
-            vec![StatementOutcome::Ok(records(3))],
-            PageMode::PushDown { page: 1, size: 2 },
-        )
-        .unwrap();
+        let p = plan("SELECT * FROM t", Some(2), 1, None)
+            .unwrap()
+            .statements;
+        let r = build_response(vec![ok(records(3))], &p).unwrap();
         assert_eq!(r["rows"], json!([[0], [1]]));
         assert_eq!(r["pagination"]["has_more"], true);
-
-        let r = build_response(
-            vec![StatementOutcome::Ok(records(2))],
-            PageMode::PushDown { page: 2, size: 2 },
-        )
-        .unwrap();
+        let p = plan("SELECT * FROM t", Some(2), 2, None)
+            .unwrap()
+            .statements;
+        let r = build_response(vec![ok(records(2))], &p).unwrap();
         assert_eq!(r["pagination"]["has_more"], false);
         assert_eq!(r["pagination"]["page"], 2);
     }
 
     #[test]
     fn slices_client_side() {
-        let r = build_response(
-            vec![StatementOutcome::Ok(records(5))],
-            PageMode::Slice { page: 2, size: 2 },
-        )
-        .unwrap();
+        let p = plan("SELECT * FROM t LIMIT 9", Some(2), 2, None)
+            .unwrap()
+            .statements;
+        let r = build_response(vec![ok(records(5))], &p).unwrap();
         assert_eq!(r["rows"], json!([[2], [3]]));
         assert_eq!(r["pagination"]["has_more"], true);
     }
 
     #[test]
-    fn multi_statement_results_become_additional_results() {
+    fn writes_report_affected_rows_and_server_time() {
+        let r = build_response(
+            vec![TimedOutcome {
+                outcome: StatementOutcome::Ok(records(3)),
+                time_ms: Some(1.5),
+            }],
+            &plans_for("UPDATE item SET seen = true"),
+        )
+        .unwrap();
+        assert_eq!(r["affected_rows"], 3);
+        assert_eq!(r["server_time_ms"], 1.5);
+        // SELECT results are rows, not affected rows.
+        let r = build_response(vec![ok(records(3))], &plans_for("SELECT * FROM item")).unwrap();
+        assert_eq!(r["affected_rows"], 0);
+        assert!(r.get("server_time_ms").is_none());
+        // DELETE returns nothing by default: no count is claimed.
+        let r = build_response(vec![ok(Cbor::Array(vec![]))], &plans_for("DELETE item")).unwrap();
+        assert_eq!(r["affected_rows"], 0);
+    }
+
+    #[test]
+    fn scripts_skip_statements_that_return_nothing() {
+        let sql = "LET $n = 1; SELECT * FROM t; RETURN 7; COMMIT";
         let r = build_response(
             vec![
-                StatementOutcome::Ok(Cbor::Tag(6, Box::new(Cbor::Null))),
-                StatementOutcome::Ok(records(1)),
-                StatementOutcome::Ok(Cbor::Integer(7.into())),
+                ok(none()),
+                ok(records(1)),
+                ok(Cbor::Integer(7.into())),
+                ok(none()),
             ],
-            PageMode::None,
+            &plans_for(sql),
+        )
+        .unwrap();
+        assert_eq!(r["rows"], json!([[0]]), "the SELECT is the primary result");
+        assert_eq!(r["additional_results"].as_array().unwrap().len(), 1);
+        assert_eq!(r["additional_results"][0]["rows"], json!([[7]]));
+
+        let r = build_response(
+            vec![ok(none()), ok(none())],
+            &plans_for("LET $a = 1; LET $b = 2"),
         )
         .unwrap();
         assert_eq!(r["columns"], json!([]));
-        assert_eq!(r["additional_results"][0]["rows"], json!([[0]]));
-        assert_eq!(r["additional_results"][1]["columns"], json!(["result"]));
-        assert!(r["pagination"].is_null());
-        assert_eq!(r["affected_rows"], 0);
+        assert!(r.get("additional_results").is_none());
+
+        // A single statement keeps its (empty) result.
+        let r = build_response(vec![ok(none())], &plans_for("DEFINE TABLE x")).unwrap();
+        assert_eq!(r["columns"], json!([]));
     }
 
     #[test]
     fn statement_errors_are_reported_with_their_position() {
         let e = build_response(
             vec![
-                StatementOutcome::Ok(records(1)),
-                StatementOutcome::Err("The table 'x' does not exist".into()),
+                ok(records(1)),
+                TimedOutcome::err("The table 'x' does not exist"),
             ],
-            PageMode::None,
+            &plans_for("SELECT 1; SELECT * FROM x"),
         )
         .unwrap_err();
         assert!(e
             .message
             .starts_with("Statement 2 of 2 failed: The table 'x' does not exist"));
-        let e = build_response(
-            vec![StatementOutcome::Err("Parse error".into())],
-            PageMode::None,
-        )
-        .unwrap_err();
+        let e = build_response(vec![TimedOutcome::err("Parse error")], &[]).unwrap_err();
         assert_eq!(e.message, "Parse error");
+    }
+
+    fn batch(queries: &[&str]) -> (String, Vec<BatchEntry>, bool) {
+        let q: Vec<String> = queries.iter().map(|s| s.to_string()).collect();
+        plan_batch(&q, Some(10), 1, None)
+    }
+
+    #[test]
+    fn batch_joins_statements_into_one_script() {
+        let (script, entries, uses_use) =
+            batch(&["LET $n = 3", "SELECT * FROM item WHERE n < $n", "-- note"]);
+        assert_eq!(
+            script,
+            "LET $n = 3;\nSELECT * FROM item WHERE n < $n\nLIMIT 11 START 0"
+        );
+        assert!(!uses_use);
+        assert!(entries[2].sql.is_none());
+        assert_eq!(
+            &script[entries[1].range.clone()],
+            entries[1].sql.as_deref().unwrap()
+        );
+    }
+
+    #[test]
+    fn batch_keeps_per_statement_errors() {
+        let (script, entries, _) = batch(&["SELECT * FROM a", "THROW 'boom'", "RETURN 2"]);
+        let out = assign_batch_outcomes(
+            &script,
+            &entries,
+            vec![
+                ok(records(2)),
+                TimedOutcome::err("An error occurred: boom"),
+                ok(Cbor::Integer(2.into())),
+            ],
+        );
+        assert_eq!(out[0]["result"]["rows"], json!([[0], [1]]));
+        assert!(out[0]["error"].is_null());
+        assert!(out[1]["result"].is_null());
+        assert_eq!(out[1]["error"], "An error occurred: boom");
+        assert_eq!(out[2]["result"]["rows"], json!([[2]]));
+    }
+
+    #[test]
+    fn batch_reassembles_blocks_the_host_split() {
+        // The host's splitter cut a function body at its inner `;`.
+        let (script, entries, _) = batch(&[
+            "DEFINE FUNCTION fn::two() { LET $a = 2",
+            "RETURN $a }",
+            "RETURN fn::two()",
+        ]);
+        assert_eq!(split_statements(&script).len(), 2);
+        let out = assign_batch_outcomes(
+            &script,
+            &entries,
+            vec![ok(none()), ok(Cbor::Integer(2.into()))],
+        );
+        assert_eq!(out[0]["result"]["columns"], json!([]));
+        assert!(out[0]["error"].is_null());
+        assert_eq!(out[1]["result"]["columns"], json!([]), "NONE from DEFINE");
+        assert_eq!(out[2]["result"]["rows"], json!([[2]]));
+    }
+
+    #[test]
+    fn batch_falls_back_when_counts_disagree() {
+        let (script, entries, _) = batch(&["RETURN 1", "RETURN 2"]);
+        let out = assign_batch_outcomes(&script, &entries, vec![ok(Cbor::Integer(9.into()))]);
+        assert_eq!(out[1]["result"]["rows"], json!([[9]]));
+        assert_eq!(out[0]["result"]["columns"], json!([]));
     }
 }

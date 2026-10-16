@@ -15,6 +15,43 @@ use crate::surreal::Registry;
 #[derive(Default)]
 pub struct Context {
     pub sessions: Registry,
+    pub settings: std::sync::RwLock<Settings>,
+}
+
+impl Context {
+    pub fn settings(&self) -> Settings {
+        self.settings
+            .read()
+            .map(|s| s.clone())
+            .unwrap_or_else(|e| e.into_inner().clone())
+    }
+}
+
+/// Plugin settings from the host's `initialize` call (Settings → plugin).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Settings {
+    /// `query_timeout_seconds`; `None` (or 0) means no plugin timeout.
+    pub query_timeout_secs: Option<u64>,
+}
+
+impl Settings {
+    /// Read `params.settings`. Unknown keys are ignored; a number may also
+    /// arrive as a string.
+    pub fn from_initialize(params: &Value) -> Self {
+        let timeout = params
+            .get("settings")
+            .and_then(|s| s.get("query_timeout_seconds"))
+            .and_then(|v| match v {
+                Value::Number(n) => n.as_f64(),
+                Value::String(s) => s.trim().parse().ok(),
+                _ => None,
+            })
+            .filter(|t| t.is_finite() && *t >= 1.0)
+            .map(|t| t.round() as u64);
+        Self {
+            query_timeout_secs: timeout,
+        }
+    }
 }
 
 /// The session configuration for the connection in `params.params`.
@@ -49,5 +86,27 @@ pub fn require_database(config: &SessionConfig) -> Result<(), PluginError> {
         Err(PluginError::invalid_params(
             "No database selected. Set the connection's Database field to `namespace/database`, or pick a database in the explorer.",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reads_the_query_timeout_setting() {
+        let t = |v: Value| {
+            Settings::from_initialize(&json!({ "settings": { "query_timeout_seconds": v } }))
+        };
+        assert_eq!(t(json!(30)).query_timeout_secs, Some(30));
+        assert_eq!(t(json!("45")).query_timeout_secs, Some(45));
+        assert_eq!(t(json!(0)).query_timeout_secs, None);
+        assert_eq!(t(json!(-5)).query_timeout_secs, None);
+        assert_eq!(t(json!(null)).query_timeout_secs, None);
+        assert_eq!(
+            Settings::from_initialize(&json!({})).query_timeout_secs,
+            None
+        );
     }
 }
