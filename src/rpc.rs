@@ -28,8 +28,7 @@ pub async fn dispatch(ctx: &Context, method: &str, params: &Value) -> Result<Val
         "get_indexes" => metadata::get_indexes(ctx, params).await,
         "get_all_columns_batch" => metadata::get_all_columns_batch(ctx, params).await,
         "get_all_foreign_keys_batch" => metadata::get_all_foreign_keys_batch(ctx, params).await,
-        // Record links and relations are not reported as foreign keys yet.
-        "get_foreign_keys" => Ok(json!([])),
+        "get_foreign_keys" => metadata::get_foreign_keys(ctx, params).await,
         // `capabilities.views` and `routines` are false.
         "get_views" | "get_routines" => Ok(json!([])),
 

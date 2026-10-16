@@ -17,7 +17,7 @@ use crate::handlers::{require_database, session_config, table_param, Context};
 use crate::models::SessionConfig;
 use crate::surreal::session::{Session, StatementOutcome};
 use crate::surreal::{retry_class, Retry};
-use crate::utils::define::{parse_field, parse_index, parse_table, TableDef};
+use crate::utils::define::{parse_field, parse_index, parse_table, record_link_targets, TableDef};
 use crate::utils::identifiers::quote_identifier;
 use crate::utils::values::{is_none, key_to_string, kind_name};
 
@@ -256,8 +256,7 @@ pub async fn get_all_columns_batch(ctx: &Context, params: &Json) -> Result<Json,
     Ok(Json::Object(out))
 }
 
-/// Record links are not reported as foreign keys yet; every table maps to
-/// an empty list so the host's ER and autocomplete paths keep working.
+/// Foreign keys of every table, for the ER diagram.
 pub async fn get_all_foreign_keys_batch(ctx: &Context, params: &Json) -> Result<Json, PluginError> {
     let config = session_config(params)?;
     require_database(&config)?;
@@ -268,8 +267,71 @@ pub async fn get_all_foreign_keys_batch(ctx: &Context, params: &Json) -> Result<
             Ok(definition_names(info.first(), "tables"))
         })
         .await?;
-    let out: Map<String, Json> = tables.into_iter().map(|t| (t, json!([]))).collect();
+    let mut out = Map::new();
+    for name in tables {
+        let meta = table_meta(ctx, &config, &name, false).await?;
+        out.insert(
+            name,
+            Json::Array(build_foreign_keys(&meta.def, &meta.fields)),
+        );
+    }
     Ok(Json::Object(out))
+}
+
+/// Record links as foreign keys: fields typed `record<t>` (also inside
+/// `option<…>`) and the `in` / `out` of relation tables. Each link points at
+/// `t.id`.
+pub async fn get_foreign_keys(ctx: &Context, params: &Json) -> Result<Json, PluginError> {
+    let config = session_config(params)?;
+    require_database(&config)?;
+    let table = table_param(params)?;
+    let meta = table_meta(ctx, &config, table, false).await?;
+    Ok(Json::Array(build_foreign_keys(&meta.def, &meta.fields)))
+}
+
+/// Build `get_foreign_keys` entries. A field that may link to several
+/// tables (`record<a | b>`) gets one entry per table, named `field→table`,
+/// so the host does not mistake them for one composite key.
+pub fn build_foreign_keys(table_def: &TableDef, fields: &[(String, String)]) -> Vec<Json> {
+    let mut links: Vec<(String, Vec<String>)> = fields
+        .iter()
+        .filter(|(name, _)| is_top_level(name))
+        .filter_map(|(name, def)| {
+            let kind = parse_field(def).kind?;
+            let targets = record_link_targets(&kind);
+            (!targets.is_empty()).then(|| (name.clone(), targets))
+        })
+        .collect();
+    if table_def.relation {
+        for (edge, targets) in [
+            ("in", &table_def.relation_in),
+            ("out", &table_def.relation_out),
+        ] {
+            if !targets.is_empty() && !links.iter().any(|(name, _)| name == edge) {
+                links.push((edge.to_string(), targets.clone()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (field, targets) in links {
+        for target in &targets {
+            let name = if targets.len() == 1 {
+                field.clone()
+            } else {
+                format!("{field}→{target}")
+            };
+            out.push(json!({
+                "name": name,
+                "column_name": field,
+                "ref_table": target,
+                "ref_column": "id",
+                "on_delete": Json::Null,
+                "on_update": Json::Null,
+                "seq_in_fk": 1,
+            }));
+        }
+    }
+    out
 }
 
 /// Is a field path top level (`name`, not `address.city` or `tags[*]`)?
@@ -593,6 +655,62 @@ mod tests {
         assert_eq!(idx[0]["column_name"], "address.city");
         assert_eq!(idx[1]["seq_in_index"], 2);
         assert_eq!(idx[2]["is_unique"], true);
+    }
+
+    #[test]
+    fn record_links_become_foreign_keys() {
+        let def = parse_table("DEFINE TABLE person SCHEMAFULL");
+        let fields = defs(&[
+            ("name", "DEFINE FIELD name ON person TYPE string"),
+            (
+                "best_friend",
+                "DEFINE FIELD best_friend ON person TYPE option<record<person>>",
+            ),
+            (
+                "owner",
+                "DEFINE FIELD owner ON person TYPE record<person | bot>",
+            ),
+            (
+                "tags",
+                "DEFINE FIELD tags ON person TYPE array<record<tag>>",
+            ),
+            (
+                "address.home",
+                "DEFINE FIELD address.home ON person TYPE record<place>",
+            ),
+        ]);
+        let fks = build_foreign_keys(&def, &fields);
+        let summary: Vec<(String, String, String)> = fks
+            .iter()
+            .map(|f| {
+                (
+                    f["name"].as_str().unwrap().to_string(),
+                    f["column_name"].as_str().unwrap().to_string(),
+                    f["ref_table"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("best_friend".into(), "best_friend".into(), "person".into()),
+                ("owner→person".into(), "owner".into(), "person".into()),
+                ("owner→bot".into(), "owner".into(), "bot".into()),
+            ]
+        );
+        assert_eq!(fks[0]["ref_column"], "id");
+    }
+
+    #[test]
+    fn relation_tables_link_in_and_out() {
+        let def = parse_table("DEFINE TABLE knows TYPE RELATION IN person OUT person SCHEMALESS");
+        let fks = build_foreign_keys(&def, &[]);
+        assert_eq!(fks.len(), 2);
+        assert_eq!(fks[0]["column_name"], "in");
+        assert_eq!(fks[1]["column_name"], "out");
+        // Declared in/out fields (3.x) are not duplicated.
+        let fields = defs(&[("in", "DEFINE FIELD in ON knows TYPE record<person>")]);
+        assert_eq!(build_foreign_keys(&def, &fields).len(), 2);
     }
 
     #[test]

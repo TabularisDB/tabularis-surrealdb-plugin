@@ -143,14 +143,22 @@ pub fn with_pagination(
     }
 }
 
-/// Undo the two places where the host's generic table-browse SQL is not
-/// valid SurrealQL, and leave every other query untouched:
+/// Undo the places where the host's generic table-browse SQL is not valid
+/// (or not meaningful) SurrealQL, and leave every other query untouched:
 ///
 /// 1. `SELECT * FROM (…) AS limited_subset` — the host wraps a user LIMIT in
 ///    a derived table with an alias; SurrealQL subqueries take no alias.
 /// 2. `` `a``b` `` — the host escapes a backtick inside a quoted identifier by
 ///    doubling it; SurrealQL escapes it as `` \` ``.
+/// 3. ``SELECT * FROM `t` WHERE `id` = 't:x'`` — the host's foreign-key
+///    lookup compares the record id with a string, which never matches in
+///    SurrealQL; the string is cast with `<record>`.
 pub fn normalize_host_browse_query(query: &str) -> String {
+    let normalized = normalize_browse_shapes(query);
+    rewrite_record_id_lookup(&normalized).unwrap_or(normalized)
+}
+
+fn normalize_browse_shapes(query: &str) -> String {
     let trimmed = query.trim().trim_end_matches(';').trim_end();
     const WRAP_PREFIX: &str = "SELECT * FROM (";
     const WRAP_SUFFIX: &str = ") AS limited_subset";
@@ -158,7 +166,7 @@ pub fn normalize_host_browse_query(query: &str) -> String {
     {
         let inner = &trimmed[WRAP_PREFIX.len()..trimmed.len() - WRAP_SUFFIX.len()];
         if is_balanced(inner) {
-            return format!("SELECT * FROM ({})", normalize_host_browse_query(inner));
+            return format!("SELECT * FROM ({})", normalize_browse_shapes(inner));
         }
     }
     const BROWSE_PREFIX: &str = "SELECT * FROM `";
@@ -203,6 +211,81 @@ fn rewrite_doubled_backtick_table(sql: &str, open: usize) -> Option<String> {
                 name.push(ch);
                 i += ch.len_utf8();
             }
+        }
+    }
+    None
+}
+
+/// ``SELECT * FROM <table> WHERE <id> = '<table>:…'`` (the whole statement)
+/// → ``SELECT * FROM <table> WHERE id = <record> '<table>:…'``. Only rewritten
+/// when the string starts with the same table, so the cast cannot fail on
+/// unrelated text. The value stays a string literal: no injection.
+fn rewrite_record_id_lookup(sql: &str) -> Option<String> {
+    let rest = strip_prefix_ignore_case(sql, "SELECT * FROM ")?;
+    let (table, after_table) = parse_identifier(rest)?;
+    let table_sql = &rest[..rest.len() - after_table.len()];
+    let rest = strip_prefix_ignore_case(after_table.trim_start(), "WHERE ")?;
+    let (column, rest) = parse_identifier(rest.trim_start())?;
+    if column != "id" {
+        return None;
+    }
+    let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+    let (value, rest) = parse_single_quoted(rest)?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    let prefix = format!("{}:", crate::utils::identifiers::format_identifier(&table));
+    if !value.starts_with(&prefix) || value.len() == prefix.len() {
+        return None;
+    }
+    Some(format!(
+        "SELECT * FROM {table_sql} WHERE id = <record> {}",
+        crate::utils::values::quote_string(&value)
+    ))
+}
+
+fn strip_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    starts_with_ignore_case(s, prefix).then(|| &s[prefix.len()..])
+}
+
+/// A backtick-quoted (`\` escapes or doubled backticks) or plain identifier.
+fn parse_identifier(s: &str) -> Option<(String, &str)> {
+    if let Some(body) = s.strip_prefix('`') {
+        let mut name = String::new();
+        let mut chars = body.char_indices().peekable();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '\\' => name.push(chars.next()?.1),
+                '`' if body[i + 1..].starts_with('`') => {
+                    chars.next();
+                    name.push('`');
+                }
+                '`' => return Some((name, &body[i + 1..])),
+                other => name.push(other),
+            }
+        }
+        return None;
+    }
+    let end = s
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(s.len());
+    (end > 0).then(|| (s[..end].to_string(), &s[end..]))
+}
+
+/// A `'…'` literal, accepting both `''` and `\'` escapes.
+fn parse_single_quoted(s: &str) -> Option<(String, &str)> {
+    let body = s.strip_prefix('\'')?;
+    let mut value = String::new();
+    let mut chars = body.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => value.push(chars.next()?.1),
+            '\'' if body[i + 1..].starts_with('\'') => {
+                chars.next();
+                value.push('\'');
+            }
+            '\'' => return Some((value, &body[i + 1..])),
+            other => value.push(other),
         }
     }
     None
@@ -513,6 +596,38 @@ mod tests {
         let stmts = split_statements(sql);
         assert_eq!(&sql[stmts[0].range.clone()], "RETURN 1");
         assert_eq!(&sql[stmts[1].range.clone()], "SELECT * FROM t");
+    }
+
+    #[test]
+    fn rewrites_host_foreign_key_lookups() {
+        assert_eq!(
+            normalize_host_browse_query("SELECT * FROM `person` WHERE `id` = 'person:alice'"),
+            "SELECT * FROM `person` WHERE id = <record> 'person:alice'"
+        );
+        assert_eq!(
+            normalize_host_browse_query("SELECT * FROM `event` WHERE `id` = 'event:`weird-id`'"),
+            "SELECT * FROM `event` WHERE id = <record> 'event:`weird-id`'"
+        );
+        assert_eq!(
+            normalize_host_browse_query(
+                "SELECT * FROM `event` WHERE `id` = 'event:[2024, ''q1'']'"
+            ),
+            "SELECT * FROM `event` WHERE id = <record> 'event:[2024, \\'q1\\']'"
+        );
+        assert_eq!(
+            normalize_host_browse_query("SELECT * FROM `odd table` WHERE id = '`odd table`:x'"),
+            "SELECT * FROM `odd table` WHERE id = <record> '`odd table`:x'"
+        );
+        // Not a record id of that table, another column, or more clauses:
+        // untouched.
+        for q in [
+            "SELECT * FROM `person` WHERE `id` = 'alice'",
+            "SELECT * FROM `person` WHERE `id` = 'event:1'",
+            "SELECT * FROM `person` WHERE `name` = 'person:alice'",
+            "SELECT * FROM `person` WHERE `id` = 'person:alice' AND age > 3",
+        ] {
+            assert_eq!(normalize_host_browse_query(q), q);
+        }
     }
 
     #[test]
