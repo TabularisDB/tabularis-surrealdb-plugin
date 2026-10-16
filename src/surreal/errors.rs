@@ -27,8 +27,9 @@ pub fn connect_error(url: &str, error: &ConnectError) -> PluginError {
         }
         ConnectError::Io(io) => format!("Could not connect to SurrealDB at {url}: {io}"),
         ConnectError::Tls(tls) => format!(
-            "TLS handshake with {url} failed: {tls}. Use a ws:// or plain host name for servers without TLS, and wss:// for servers with TLS."
+            "TLS handshake with {url} failed: {tls}. For a server with a private or self-signed certificate, set its CA certificate file in the SSL tab (SSL mode Verify CA or Verify Identity), or use SSL mode Required to encrypt without checking the certificate. For a server without TLS, use SSL mode Disabled or a ws:// URL."
         ),
+        ConnectError::TlsConfig(e) => e.clone(),
         ConnectError::InvalidUrl(e) => format!("Invalid SurrealDB address {url}: {e}"),
         ConnectError::Other(e) => format!("Could not connect to SurrealDB at {url}: {e}"),
     };
@@ -160,6 +161,7 @@ mod tests {
             username: Some("reader".into()),
             password: Some("x".into()),
             auth: AuthLevel::Auto,
+            tls: Default::default(),
             connection_id: None,
         }
     }

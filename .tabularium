@@ -36,7 +36,7 @@
     "manage_tables": false,
     "readonly": true,
     "explain": false,
-    "supports_ssl": false
+    "supports_ssl": true
   },
   "data_types": [
     { "name": "any", "category": "other", "requires_length": false, "requires_precision": false },

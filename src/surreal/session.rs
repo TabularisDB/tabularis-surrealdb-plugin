@@ -32,7 +32,7 @@ impl Session {
     /// Connect, sign in, check that the namespace/database exists and
     /// select it.
     pub async fn open(config: &SessionConfig) -> Result<Self, PluginError> {
-        let client = RpcClient::connect(&config.url, CONNECT_TIMEOUT)
+        let client = RpcClient::connect(&config.url, CONNECT_TIMEOUT, &config.tls)
             .await
             .map_err(|e| errors::connect_error(&config.url, &e))?;
         let signed_in_as = bounded("signing in", sign_in(&client, config)).await??;
@@ -395,6 +395,7 @@ mod tests {
             username: Some("u".into()),
             password: Some("p".into()),
             auth: AuthLevel::Auto,
+            tls: Default::default(),
             connection_id: None,
         }
     }

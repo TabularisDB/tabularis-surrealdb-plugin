@@ -4,6 +4,7 @@
 pub mod client;
 pub mod errors;
 pub mod session;
+pub mod tls;
 
 use std::collections::HashMap;
 use std::future::Future;
