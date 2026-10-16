@@ -45,11 +45,11 @@ Other factors:
 
 ## Supported SurrealDB versions
 
-- **3.x**: tested. The live test passes against 3.2.3 (local).
-- **2.x**: supported by design but not yet verified against a server. The
-  CI job `live-db-integration` runs the same live test against both the
-  `surrealdb/surrealdb:v2` and `:v3` images, so the first CI run on this
-  branch is the 2.x verification. To verify locally without installing another version:
+- **3.x**: tested. The live test passes against 3.2.3 locally and against
+  the `surrealdb/surrealdb:v3` image in CI.
+- **2.x**: tested. The CI job `live-db-integration` runs the same live test
+  against the `surrealdb/surrealdb:v2` image, and it passes. To run it
+  locally without installing another version:
   `docker run --rm -p 8000:8000 surrealdb/surrealdb:v2 start --user root --pass root memory`,
   then `just live-test`.
 - **1.x**: not supported (EOL; INFO output, auth and CBOR differ).

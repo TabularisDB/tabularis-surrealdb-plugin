@@ -40,8 +40,8 @@ Design decisions and their evidence are in [docs/DESIGN.md](docs/DESIGN.md).
 
 | Version | Status |
 |---|---|
-| 3.x | Supported. Tested against 3.2.3. |
-| 2.x | Supported by design. CI runs the live test against `surrealdb/surrealdb:v2` (and `:v3`); not yet verified locally. |
+| 3.x | Supported. Tested against 3.2.3 locally, and against `surrealdb/surrealdb:v3` in CI. |
+| 2.x | Supported. CI runs the live test against `surrealdb/surrealdb:v2`. |
 | 1.x | Not supported. |
 
 The plugin connects over SurrealDB's WebSocket RPC protocol (`/rpc`) with
