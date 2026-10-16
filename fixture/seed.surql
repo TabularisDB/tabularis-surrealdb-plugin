@@ -34,12 +34,14 @@ DEFINE FIELD address.city ON person TYPE string;
 DEFINE FIELD address.zip ON person TYPE option<string>;
 DEFINE FIELD tags ON person TYPE array<string> DEFAULT [];
 DEFINE FIELD balance ON person TYPE decimal DEFAULT 0dec;
+DEFINE FIELD best_friend ON person TYPE option<record<person>>;
 DEFINE INDEX person_name ON person FIELDS name UNIQUE;
 DEFINE INDEX person_city_age ON person FIELDS address.city, age;
 
 CREATE person:alice CONTENT {
     name: 'Alice', age: 30, address: { city: 'Rome', zip: '00184' },
-    tags: ['admin', 'ops'], balance: 12.345678901234567890123dec
+    tags: ['admin', 'ops'], balance: 12.345678901234567890123dec,
+    best_friend: person:bob
 };
 CREATE person:bob CONTENT { name: 'Bob', address: { city: 'Oslo' }, balance: 1dec };
 CREATE person:carol CONTENT { name: 'Carol', age: 41, address: { city: 'Lima' } };
@@ -52,6 +54,7 @@ RELATE person:bob->knows->person:carol SET since = 2021;
 -- SCHEMALESS with heterogeneous records: columns are sampled from data.
 DEFINE TABLE event SCHEMALESS COMMENT 'Heterogeneous events';
 DEFINE FIELD kind ON event TYPE string;
+DEFINE FIELD actor ON event TYPE option<record<person>>;
 CREATE event:1 CONTENT {
     kind: 'signup',
     actor: person:alice,
@@ -80,6 +83,10 @@ FOR $i IN [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
 
 -- Lets two connections to different databases tell which one they read.
 DEFINE TABLE marker SCHEMALESS;
+
+-- Scratch table for write tests (affected rows).
+REMOVE TABLE IF EXISTS scratch;
+DEFINE TABLE scratch SCHEMALESS;
 
 -- A read-only database user, for permission errors.
 DEFINE USER reader ON DATABASE PASSWORD 'reader-pass' ROLES VIEWER;

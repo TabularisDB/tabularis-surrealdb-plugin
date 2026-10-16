@@ -17,12 +17,12 @@
 //! The test seeds `fixture/seed.surql` into `<ns>/<db>` and creates
 //! `<ns>/<db>_iso` for the isolation check.
 
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+mod common;
+
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use common::Plugin;
 use serde_json::{json, Value};
 
 const SEED: &str = include_str!("../fixture/seed.surql");
@@ -61,111 +61,6 @@ macro_rules! live {
             }
         }
     };
-}
-
-/// One plugin process.
-struct Plugin {
-    child: Child,
-    stdin: ChildStdin,
-    lines: Receiver<String>,
-    next_id: u64,
-    /// Responses read while waiting for another id.
-    stash: Vec<Value>,
-}
-
-impl Plugin {
-    fn start() -> Self {
-        let bin = std::env::var("SURREALDB_PLUGIN_BIN")
-            .unwrap_or_else(|_| env!("CARGO_BIN_EXE_surrealdb-plugin").to_string());
-        let mut child = Command::new(&bin)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap_or_else(|e| panic!("cannot start {bin}: {e}"));
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let (tx, lines) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        Self {
-            child,
-            stdin,
-            lines,
-            next_id: 1,
-            stash: Vec::new(),
-        }
-    }
-
-    fn send(&mut self, method: &str, params: Value) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        let request = json!({ "jsonrpc": "2.0", "method": method, "params": params, "id": id });
-        writeln!(self.stdin, "{request}").unwrap();
-        self.stdin.flush().unwrap();
-        id
-    }
-
-    fn notify(&mut self, method: &str, params: Value) {
-        let request = json!({ "jsonrpc": "2.0", "method": method, "params": params });
-        writeln!(self.stdin, "{request}").unwrap();
-        self.stdin.flush().unwrap();
-    }
-
-    /// Wait for the response to `id`.
-    fn wait(&mut self, id: u64, timeout: Duration) -> Option<Value> {
-        if let Some(pos) = self.stash.iter().position(|v| v["id"] == id) {
-            return Some(self.stash.remove(pos));
-        }
-        let deadline = Instant::now() + timeout;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match self.lines.recv_timeout(left) {
-                Ok(line) => {
-                    let v: Value = serde_json::from_str(&line)
-                        .unwrap_or_else(|e| panic!("plugin wrote non-JSON {line:?}: {e}"));
-                    if v["id"] == id {
-                        return Some(v);
-                    }
-                    self.stash.push(v);
-                }
-                Err(RecvTimeoutError::Timeout) => return None,
-                Err(RecvTimeoutError::Disconnected) => panic!("plugin exited"),
-            }
-        }
-    }
-
-    fn call(&mut self, method: &str, params: Value) -> Result<Value, (i64, String)> {
-        let id = self.send(method, params);
-        let response = self
-            .wait(id, Duration::from_secs(30))
-            .unwrap_or_else(|| panic!("no response to {method}"));
-        match response.get("error") {
-            Some(e) => Err((
-                e["code"].as_i64().unwrap_or_default(),
-                e["message"].as_str().unwrap_or_default().to_string(),
-            )),
-            None => Ok(response["result"].clone()),
-        }
-    }
-
-    fn ok(&mut self, method: &str, params: Value) -> Value {
-        self.call(method, params.clone())
-            .unwrap_or_else(|e| panic!("{method} {params} failed: {e:?}"))
-    }
-}
-
-impl Drop for Plugin {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 fn connection(e: &Env, database: &str, connection_id: &str) -> Value {
@@ -442,11 +337,22 @@ fn discovers_databases_tables_columns_and_indexes() {
         .iter()
         .map(|c| c["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["id", "address", "age", "balance", "name", "tags"]);
+    assert_eq!(
+        names,
+        [
+            "id",
+            "address",
+            "age",
+            "balance",
+            "best_friend",
+            "name",
+            "tags"
+        ]
+    );
     let age = &cols[2];
     assert!(age["data_type"].as_str().unwrap().contains("int"));
     assert_eq!(age["is_nullable"], true);
-    assert_eq!(cols[4]["comment"], "Display name");
+    assert_eq!(cols[5]["comment"], "Display name");
 
     // SCHEMALESS: declared `kind` plus keys sampled from the records.
     let cols = p.ok(
@@ -462,7 +368,10 @@ fn discovers_databases_tables_columns_and_indexes() {
             .clone()
     };
     assert_eq!(by_name("kind")["data_type"], "string");
-    assert_eq!(by_name("actor")["data_type"], "record");
+    assert!(by_name("actor")["data_type"]
+        .as_str()
+        .unwrap()
+        .contains("record<person>"));
     assert_eq!(by_name("payload")["data_type"], "object");
     assert_eq!(by_name("exact")["data_type"], "decimal");
     assert_eq!(by_name("at")["data_type"], "datetime");
@@ -665,10 +574,11 @@ fn runs_native_surrealql() {
         &conn,
         "LET $n = 2; SELECT * FROM item WHERE n <= $n ORDER BY n; RETURN 'done';",
     );
-    assert_eq!(r["columns"], json!([]), "LET returns NONE");
+    // LET returns NONE and produces no result set: the SELECT is primary.
+    assert_eq!(r["rows"].as_array().unwrap().len(), 2);
     let extra = r["additional_results"].as_array().unwrap();
-    assert_eq!(extra[0]["rows"].as_array().unwrap().len(), 2);
-    assert_eq!(extra[1]["rows"], json!([["done"]]));
+    assert_eq!(extra.len(), 1);
+    assert_eq!(extra[0]["rows"], json!([["done"]]));
 
     // Errors name the failing statement.
     let (_, message) = p
@@ -765,4 +675,218 @@ fn cancel_stops_waiting_and_keeps_the_plugin_responsive() {
     // The shared session still works after the cancellation.
     let r = query(&mut p, &conn, "RETURN 'still here'");
     assert_eq!(r["rows"], json!([["still here"]]));
+}
+
+/// A plugin process whose `initialize` set the given settings.
+fn plugin_with_settings(settings: Value) -> Plugin {
+    let mut p = Plugin::start();
+    p.ok("initialize", json!({ "settings": settings }));
+    p
+}
+
+#[test]
+fn record_links_are_foreign_keys_and_navigable() {
+    let e = live!();
+    let mut p = Plugin::start();
+    let conn = connection(&e, &main_db(&e), "fk");
+
+    let fks = p.ok(
+        "get_foreign_keys",
+        json!({ "params": conn, "table": "person", "schema": null }),
+    );
+    assert_eq!(
+        fks,
+        json!([{ "name": "best_friend", "column_name": "best_friend", "ref_table": "person",
+                 "ref_column": "id", "on_delete": null, "on_update": null, "seq_in_fk": 1 }])
+    );
+    let fks = p.ok(
+        "get_foreign_keys",
+        json!({ "params": conn, "table": "knows", "schema": null }),
+    );
+    let cols: Vec<&str> = fks
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["column_name"].as_str().unwrap())
+        .collect();
+    assert_eq!(cols, ["in", "out"]);
+    let batch = p.ok(
+        "get_all_foreign_keys_batch",
+        json!({ "params": conn, "schema": null }),
+    );
+    assert_eq!(batch["event"][0]["column_name"], "actor");
+    assert_eq!(batch["item"], json!([]));
+
+    // The host follows a link with `SELECT * FROM <ref_table> WHERE <ref_column> = '<value>'`.
+    for (table, id) in [
+        ("person", "person:bob"),
+        ("event", "event:`weird-id`"),
+        ("event", "event:[2024, 'q1']"),
+    ] {
+        let sql = format!(
+            "SELECT * FROM `{table}` WHERE `id` = '{}'",
+            id.replace('\'', "''")
+        );
+        let r = p.ok(
+            "execute_query",
+            json!({ "params": conn, "query": sql, "limit": 100, "page": 1 }),
+        );
+        assert_eq!(r["rows"].as_array().unwrap().len(), 1, "{sql}");
+        assert_eq!(cell(&r, 0, "id"), id);
+    }
+}
+
+#[test]
+fn batches_run_as_one_script_with_per_statement_results() {
+    let e = live!();
+    let mut p = Plugin::start();
+    let conn = connection(&e, &main_db(&e), "batch");
+    let run = |p: &mut Plugin, queries: Value| {
+        p.ok(
+            "execute_query_batch",
+            json!({ "params": conn, "queries": queries, "limit": 10, "page": 1, "session_id": "tab-1" }),
+        )
+    };
+
+    // LET carries over, an error stays with its statement, later
+    // statements still run and show.
+    let out = run(
+        &mut p,
+        json!([
+            "LET $n = 3",
+            "SELECT n FROM item WHERE n < $n ORDER BY n",
+            "THROW 'boom'",
+            "RETURN $n * 2",
+            "SELECT * FROM item ORDER BY n"
+        ]),
+    );
+    let out = out.as_array().unwrap();
+    assert_eq!(out.len(), 5);
+    assert_eq!(out[0]["result"]["columns"], json!([]));
+    assert_eq!(out[1]["result"]["rows"], json!([[1], [2]]));
+    assert!(out[2]["result"].is_null());
+    assert!(out[2]["error"].as_str().unwrap().contains("boom"));
+    assert_eq!(out[3]["result"]["rows"], json!([[6]]));
+    assert_eq!(
+        out[4]["result"]["rows"].as_array().unwrap().len(),
+        10,
+        "paged"
+    );
+    assert_eq!(out[4]["result"]["pagination"]["has_more"], true);
+    assert!(out[1]["execution_time_ms"].as_f64().is_some());
+
+    // A function body the host's splitter cut at its inner `;`.
+    let out = run(
+        &mut p,
+        json!([
+            "REMOVE FUNCTION IF EXISTS fn::two",
+            "DEFINE FUNCTION fn::two() { LET $a = 2",
+            "RETURN $a }",
+            "RETURN fn::two()"
+        ]),
+    );
+    let out = out.as_array().unwrap();
+    assert!(out.iter().all(|o| o["error"].is_null()), "{out:?}");
+    assert_eq!(out[3]["result"]["rows"], json!([[2]]));
+
+    // A transaction across statements.
+    let out = run(
+        &mut p,
+        json!([
+            "BEGIN TRANSACTION",
+            "CREATE scratch:tx SET v = 1",
+            "CANCEL TRANSACTION",
+            "SELECT * FROM scratch:tx"
+        ]),
+    );
+    assert_eq!(
+        out[3]["result"]["rows"],
+        json!([]),
+        "cancelled transaction left no record: {out}"
+    );
+}
+
+#[test]
+fn result_shapes_writes_and_empty_results() {
+    let e = live!();
+    let mut p = Plugin::start();
+    let conn = connection(&e, &main_db(&e), "shapes");
+
+    // Writes report the records they returned as affected rows.
+    query(&mut p, &conn, "DELETE scratch");
+    let r = query(
+        &mut p,
+        &conn,
+        "CREATE scratch:a SET v = 1; CREATE scratch:b SET v = 2;",
+    );
+    assert_eq!(r["affected_rows"], 1);
+    assert_eq!(r["additional_results"][0]["affected_rows"], 1);
+    let r = query(&mut p, &conn, "UPDATE scratch SET seen = true");
+    assert_eq!(r["affected_rows"], 2);
+    assert!(r["server_time_ms"].as_f64().is_some());
+    let r = query(&mut p, &conn, "DELETE scratch");
+    assert_eq!(r["affected_rows"], 0, "DELETE returns nothing by default");
+
+    // Statements that return nothing do not hide the result in a notebook
+    // cell (which shows the primary result only).
+    let r = query(
+        &mut p,
+        &conn,
+        "LET $who = person:alice; SELECT name FROM $who",
+    );
+    assert_eq!(r["rows"], json!([["Alice"]]));
+    assert!(r.get("additional_results").is_none());
+
+    // Empty results.
+    let r = p.ok(
+        "execute_query",
+        json!({ "params": conn, "query": "SELECT * FROM item WHERE n > 1000", "limit": 10, "page": 1 }),
+    );
+    assert_eq!(r["rows"], json!([]));
+    assert_eq!(r["pagination"]["has_more"], false);
+
+    // EXPLAIN typed in the editor returns the plan as data (2.x and 3.x
+    // shapes differ; both render).
+    let r = query(
+        &mut p,
+        &conn,
+        "SELECT * FROM person WHERE name = 'Alice' EXPLAIN",
+    );
+    assert!(!r["rows"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn query_timeout_is_enforced_with_actionable_errors() {
+    let e = live!();
+    let mut p = plugin_with_settings(json!({ "query_timeout_seconds": 1 }));
+    let conn = connection(&e, &main_db(&e), "timeout");
+
+    // A paged SELECT carries TIMEOUT 1s: the server stops it.
+    let started = Instant::now();
+    let (_, message) = p
+        .call(
+            "execute_query",
+            json!({ "params": conn, "query": "SELECT n FROM item WHERE sleep(100ms) = NONE", "limit": 50, "page": 1 }),
+        )
+        .unwrap_err();
+    assert!(
+        message.contains("exceeded the timeout") && message.contains("query timeout setting"),
+        "{message}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    // Anything else: the plugin stops waiting after the timeout (+1s).
+    let started = Instant::now();
+    let (_, message) = p
+        .call(
+            "execute_query",
+            json!({ "params": conn, "query": "RETURN sleep(4s)", "page": 1 }),
+        )
+        .unwrap_err();
+    assert!(message.contains("plugin's query timeout (1s)"), "{message}");
+    assert!(started.elapsed() < Duration::from_secs(3));
+
+    // The connection is still usable.
+    let r = query(&mut p, &conn, "RETURN 'ok'");
+    assert_eq!(r["rows"], json!([["ok"]]));
 }
