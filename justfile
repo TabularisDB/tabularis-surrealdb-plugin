@@ -13,9 +13,19 @@ build: build-ui
 release: build-ui
     cargo build --release
 
-# Run unit tests.
+# Run unit tests (the live test skips itself without SURREAL_URL).
 test:
     cargo test
+
+# Start a throwaway in-memory SurrealDB on port 8000 for local testing.
+surreal:
+    surreal start memory --user root --pass root --bind 127.0.0.1:8000
+
+# Run the live integration test against `just surreal` (seeds fixture/seed.surql into test/test).
+[unix]
+live-test:
+    SURREAL_URL=ws://127.0.0.1:8000 SURREAL_USER=root SURREAL_PASS=root SURREAL_NS=test SURREAL_DB=test \
+        cargo test --test live_db -- --test-threads=1
 
 # Launch the local REPL that simulates Tabularis JSON-RPC calls over stdio.
 repl:
