@@ -1,64 +1,128 @@
-//! Local REPL that simulates Tabularis JSON-RPC calls.
+//! Interactive REPL that drives the real plugin binary over JSON-RPC stdio,
+//! the way Tabularis does.
 //!
 //! Usage: `just repl` or `cargo run --bin test_plugin`
 //!
-//! Type a method name (e.g. `get_tables`) to send a stub request.
-//! Type `exit` or press Ctrl-D to quit.
+//! Connection settings come from the environment (defaults in brackets):
+//! `SURREAL_HOST` [localhost], `SURREAL_PORT` [8000], `SURREAL_NS` [test],
+//! `SURREAL_DB` [test], `SURREAL_USER` [root], `SURREAL_PASS` [root].
+//! `SURREALDB_PLUGIN_BIN` overrides the plugin binary (default: the
+//! `surrealdb-plugin` next to this executable).
+//!
+//! Commands:
+//!   test                     test_connection
+//!   databases                get_databases
+//!   tables                   get_tables
+//!   columns <table>          get_columns
+//!   indexes <table>          get_indexes
+//!   page <n> <sql>           execute_query, page n of 10 rows
+//!   <any other text>         execute_query with that SurrealQL
+//!   raw <method> <json>      any method; <json> is merged into params
+//!   exit
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufReader, Write};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
-use serde_json::json;
+use serde_json::{json, Value};
 
-fn main() {
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-
-    println!("test_plugin — type a method name, `help` for commands, `exit` to quit");
-
-    let mut next_id: u64 = 1;
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
-        let cmd = line.trim();
-        if cmd.is_empty() {
-            continue;
-        }
-        if cmd == "exit" || cmd == "quit" {
-            break;
-        }
-        if cmd == "help" {
-            println!("  Any method name is sent as a JSON-RPC request with stub params.");
-            println!("  Examples: test_connection, get_tables, execute_query");
-            println!("  Full method list: https://github.com/TabularisDB/tabularis/blob/main/plugins/PLUGIN_GUIDE.md#5-required-methods");
-            continue;
-        }
-
-        let request = json!({
-            "jsonrpc": "2.0",
-            "method": cmd,
-            "params": { "params": {}, "schema": null, "query": "" },
-            "id": next_id,
-        });
-        next_id += 1;
-
-        let response = simulate(&request);
-        let pretty =
-            serde_json::to_string_pretty(&response).unwrap_or_else(|_| response.to_string());
-        writeln!(out, "{pretty}").ok();
-        out.flush().ok();
-    }
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-/// In-process simulation: serialize the request and hand it to the main
-/// dispatch loop so we exercise exactly the same code path.
-fn simulate(request: &serde_json::Value) -> serde_json::Value {
-    // This binary doesn't share `mod`s with `main.rs`. For simplicity we
-    // shell out via `serde_json::Value::to_string` and expect the user
-    // to run the main binary separately for end-to-end tests. The REPL
-    // here just round-trips the JSON to let you sanity-check method names.
-    json!({
-        "jsonrpc": "2.0",
-        "result": { "echoed": request },
-        "id": request.get("id").cloned().unwrap_or(serde_json::Value::Null),
-    })
+fn plugin_path() -> PathBuf {
+    if let Ok(p) = std::env::var("SURREALDB_PLUGIN_BIN") {
+        return PathBuf::from(p);
+    }
+    let mut p = std::env::current_exe().expect("current exe");
+    p.set_file_name(format!("surrealdb-plugin{}", std::env::consts::EXE_SUFFIX));
+    p
+}
+
+fn main() {
+    let connection = json!({
+        "driver": "surrealdb",
+        "host": env_or("SURREAL_HOST", "localhost"),
+        "port": env_or("SURREAL_PORT", "8000").parse::<u16>().unwrap_or(8000),
+        "database": format!("{}/{}", env_or("SURREAL_NS", "test"), env_or("SURREAL_DB", "test")),
+        "username": env_or("SURREAL_USER", "root"),
+        "password": env_or("SURREAL_PASS", "root"),
+        "connection_id": "repl",
+    });
+
+    let path = plugin_path();
+    let mut child = Command::new(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap_or_else(|e| {
+            panic!(
+                "cannot start {}: {e} (run `cargo build` first)",
+                path.display()
+            )
+        });
+    let mut plugin_in = child.stdin.take().expect("stdin");
+    let mut plugin_out = BufReader::new(child.stdout.take().expect("stdout"));
+
+    println!("test_plugin: driving {}", path.display());
+    println!("connection: {connection}");
+    println!("type `help` for commands");
+
+    let mut next_id = 1u64;
+    let stdin = io::stdin();
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { break };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (word, rest) = line.split_once(' ').unwrap_or((line, ""));
+        let (method, mut params) = match word {
+            "exit" | "quit" => break,
+            "help" => {
+                println!("test | databases | tables | columns <t> | indexes <t> | page <n> <sql> | raw <method> <json> | <SurrealQL>");
+                continue;
+            }
+            "test" => ("test_connection", json!({})),
+            "databases" => ("get_databases", json!({})),
+            "tables" => ("get_tables", json!({ "schema": null })),
+            "columns" => ("get_columns", json!({ "table": rest, "schema": null })),
+            "indexes" => ("get_indexes", json!({ "table": rest, "schema": null })),
+            "page" => {
+                let (n, sql) = rest.split_once(' ').unwrap_or(("1", rest));
+                (
+                    "execute_query",
+                    json!({ "query": sql, "limit": 10, "page": n.parse::<u64>().unwrap_or(1) }),
+                )
+            }
+            "raw" => {
+                let (m, extra) = rest.split_once(' ').unwrap_or((rest, "{}"));
+                let extra: Value = serde_json::from_str(extra).unwrap_or_else(|_| json!({}));
+                (Box::leak(m.to_string().into_boxed_str()) as &str, extra)
+            }
+            _ => (
+                "execute_query",
+                json!({ "query": line, "limit": null, "page": 1 }),
+            ),
+        };
+        params["params"] = connection.clone();
+        let request =
+            json!({ "jsonrpc": "2.0", "method": method, "params": params, "id": next_id });
+        next_id += 1;
+
+        writeln!(plugin_in, "{request}").expect("write to plugin");
+        plugin_in.flush().ok();
+        let mut response = String::new();
+        if plugin_out.read_line(&mut response).unwrap_or(0) == 0 {
+            eprintln!("plugin exited");
+            break;
+        }
+        match serde_json::from_str::<Value>(&response) {
+            Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap_or(response)),
+            Err(_) => print!("{response}"),
+        }
+    }
+    drop(plugin_in);
+    let _ = child.wait();
 }
