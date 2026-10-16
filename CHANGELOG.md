@@ -32,3 +32,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   found" response; the manifest declares the plugin read-only.
 - Live integration test (`tests/live_db.rs`) and fixture
   (`fixture/seed.surql`).
+- `execute_query_batch`: the editor's "run all" runs as one SurrealQL
+  query, so `LET` and transactions work across statements, with one result
+  or error per statement and the server's execution time.
+- Record links as foreign keys (`get_foreign_keys`,
+  `get_all_foreign_keys_batch`), and the grid's foreign-key lookup is cast
+  to a record id so it finds the linked record.
+- TLS settings from the SSL tab (`supports_ssl`): Required, Verify CA and
+  Verify Identity modes and a CA certificate file. Live TLS test with a
+  private CA (`tests/live_tls.rs`).
+- Plugin setting `query_timeout_seconds`: paged SELECTs get a SurrealQL
+  `TIMEOUT`, every query is bounded locally, with actionable errors.
+- Affected rows for CREATE, INSERT, UPDATE, UPSERT, DELETE and RELATE, and
+  the server's statement time on results.
+
+### Changed
+
+- In a multi-statement `execute_query`, statements that return NONE
+  (`LET`, `DEFINE`, `BEGIN`, …) no longer produce empty result sets; the
+  first real result is the primary one, which notebook cells show.
