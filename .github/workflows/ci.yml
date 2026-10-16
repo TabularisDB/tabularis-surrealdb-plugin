@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    # Default types are opened/synchronize/reopened, which miss title-only
+    # edits — needed so pr-title re-checks a title edit.
+    types: [opened, edited, reopened, synchronize]
+  schedule:
+    # Weekly cargo-audit sweep to catch newly-disclosed CVEs in deps that
+    # haven't otherwise changed. Off-peak minute, not :00/:30.
+    - cron: "17 6 * * 1"
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build
+
+      - name: Run tests
+        # --lib --bins excludes tests/live_db.rs: that's a live-database
+        # integration test requiring a running SurrealDB instance, covered
+        # by the dedicated live-db-integration job below.
+        run: cargo test --lib --bins
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  validate-manifest:
+    name: Validate .tabularium manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate against the live registry schema
+        run: npx --yes @tabularium/cli validate .tabularium --registry https://registry.tabularis.dev --kind driver
+
+  pr-title:
+    name: PR title (Conventional Commits)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  markdownlint:
+    name: Markdown lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run markdownlint
+        run: npx --yes markdownlint-cli "**/*.md"
+
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+      # rustsec/audit-check only files a tracking issue for informational
+      # warnings (e.g. "unmaintained") on cron-scheduled runs.
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  live-db-integration:
+    name: Live SurrealDB integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Started with docker run instead of a service container: the SurrealDB
+      # image needs a `start` command, which `services:` cannot pass.
+      - name: Start SurrealDB
+        run: |
+          docker run -d --name surrealdb -p 8000:8000 surrealdb/surrealdb:v2 \
+            start --user root --pass root memory
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000/health && exit 0
+            sleep 2
+          done
+          docker logs surrealdb
+          echo "::error::SurrealDB did not become healthy"
+          exit 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build
+
+      - name: Run live-database integration test
+        env:
+          SURREALDB_PLUGIN_BIN: ${{ github.workspace }}/target/debug/surrealdb-plugin
+          SURREAL_URL: ws://127.0.0.1:8000
+          SURREAL_USER: root
+          SURREAL_PASS: root
+          SURREAL_NS: test
+          SURREAL_DB: test
+        run: cargo test --test live_db -- --test-threads=1
