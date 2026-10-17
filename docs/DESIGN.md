@@ -40,6 +40,7 @@ Status: **M1** = milestone 1 (PR #1), **M2** = this milestone, **deferred**
 | `session_id`, `release_session` | `session_id` accepted and ignored; `release_session` answers `-32601`, which the host tolerates. Deferred: transactions that span separate runs (SurrealDB transactions live inside one `query` call; 3.x interactive transactions need the `begin`/`commit` RPC) | — |
 | `cancel` notification | M1: local only; server-side `query_cancel` (3.3+) deferred, see Cancellation | `cancel_stops_waiting…` |
 | `get_table_query_template` (`table_query_templates`) | M1 | `browses_tables…` runs the templates |
+| `get_column_stats` (`column_stats`) | Added for Tabularis #1137 (needs a host with that change); see Column statistics | `column_statistics_…` live tests, `handlers::stats` tests |
 | `explain_query` (`explain`) | Deferred, capability off; see EXPLAIN | typed `… EXPLAIN` works as a query: `result_shapes…` |
 | Views (`views`), materialized views | Deferred / not applicable. Table views (`DEFINE TABLE … AS SELECT`) are listed as tables with a "table view" comment | — |
 | Routines (`routines`, `routine_management`) | Deferred: `DEFINE FUNCTION` could map, not in scope | — |
@@ -325,6 +326,70 @@ the protocol requires and deletes nothing.
 `sql_dialect` is `mysql`, the closest dialect the host knows: backtick
 identifiers and backslash escapes in strings, as in SurrealQL. Without it the
 host would assume PostgreSQL quoting.
+
+## Column statistics
+
+The grid's column header menu has a "Column statistics" popover: row, NULL
+and distinct counts, min / max and the 10 most frequent values, for the rows
+matching the tab's filter. Tabularis builds it with generic SQL
+(`COUNT(DISTINCT col)`, `GROUP BY col ORDER BY 2 DESC, 1 LIMIT n`) for
+SQL engines. That SQL is not SurrealQL, and since `sql_dialect` is `mysql`
+the host would otherwise treat the plugin as SQL-compatible. The manifest
+therefore declares `column_stats: true`, and the plugin answers
+`get_column_stats` (Tabularis #1137) in SurrealQL. Older hosts ignore the
+capability.
+
+The request names the table and column (unquoted), the tab's filter (a
+SurrealQL condition, as typed in the grid), a top-N limit and which parts to
+compute. The host never asks for min / max or top values of a masked column,
+and drops them anyway if they come back. The plugin sends one script in one
+`query` call, on the connection's session, bounded by the query timeout
+setting like any other query:
+
+```sql
+SELECT count() AS rows, count((`c` = NONE) OR (`c` = NULL)) AS nulls
+  FROM `t` WHERE (<filter>) GROUP ALL;
+LET $values = (SELECT `c` AS v FROM `t`
+  WHERE (<filter>) AND `c` != NONE AND `c` != NULL LIMIT 100000);
+RETURN { sampled: array::len($values),
+         distinct: array::len(array::distinct($values.v)),
+         min: array::min($values.v), max: array::max($values.v) };
+SELECT v, count() AS count FROM $values
+  GROUP BY v ORDER BY count DESC, v ASC LIMIT 10;
+```
+
+Only the parts the host asked for are added. Choices:
+
+- **NULL.** A missing field is NONE. Both NONE and NULL count as NULL, the
+  way the grid shows both as an empty cell.
+- **Counts are exact.** `count()` with `GROUP ALL` reads every matching
+  record, the same work as counting the filtered rows of the grid.
+- **Value statistics are sampled on big tables.** Distinct count, min / max
+  and top values are computed from the first 100 000 non-NULL values in the
+  table's natural (record id) order, kept in `$values` on the server. When
+  the column has more non-NULL values than that, the result carries
+  `sample_size: 100000` and the popover says the values come from a sample.
+  The first records are not a random sample; a random one
+  (`ORDER BY rand()`) would have to read and sort the whole table, which is
+  what the cap avoids. Grouping runs over `$values`, so the table is read
+  twice at most (once for the counts, once for the sample).
+- **Min / max.** `array::min` / `array::max` compare with SurrealDB's own
+  ordering, so they work for numbers, datetimes, strings and durations
+  alike (`math::min` only takes numbers). The host asks for them only for
+  numeric and date/time columns.
+- **Top values.** `GROUP BY v` over the sample, ties broken by value. Values
+  are converted like grid cells (record ids as `table:id`, datetimes as
+  text).
+- **Filter.** The filter is inserted as `(<filter>\n)`: the newline keeps a
+  trailing `--` comment from swallowing the bracket. A filter with
+  unbalanced brackets or quotes, or a second statement, is refused with
+  `-32602` instead of being spliced into the script.
+- **Empty results.** 2.x returns no row for a `GROUP ALL` over nothing, 3.x
+  a zero row; both read as 0.
+
+Verified live on 3.2.3 (`column_statistics_respect_the_filter_and_the_requested_parts`,
+`column_statistics_sample_large_tables_and_keep_exact_counts` with over 100 000
+rows). CI runs the same live tests on v2.
 
 ## Result mapping
 

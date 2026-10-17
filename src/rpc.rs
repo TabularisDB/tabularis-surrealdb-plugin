@@ -3,7 +3,7 @@
 use serde_json::{json, Value};
 
 use crate::error::PluginError;
-use crate::handlers::{metadata, query, templates, Context, Settings};
+use crate::handlers::{metadata, query, stats, templates, Context, Settings};
 
 const READ_ONLY: &str = "the SurrealDB plugin is read-only in this release";
 const NO_DDL: &str = "schema changes are not supported by the SurrealDB plugin yet";
@@ -35,6 +35,7 @@ pub async fn dispatch(ctx: &Context, method: &str, params: &Value) -> Result<Val
         "execute_query" => query::execute_query(ctx, params).await,
         "execute_query_batch" => query::execute_query_batch(ctx, params).await,
         "get_table_query_template" => templates::get_table_query_template(params),
+        "get_column_stats" => stats::get_column_stats(ctx, params).await,
 
         "insert_record" | "update_record" | "delete_record" | "save_blob_to_file" => {
             Err(PluginError::unsupported(method, READ_ONLY))
@@ -140,6 +141,14 @@ mod tests {
     #[test]
     fn metadata_without_a_database_is_an_actionable_error() {
         let e = run("get_tables", json!({ "params": { "host": "localhost" } })).unwrap_err();
+        assert!(e.message.contains("namespace/database"));
+        let request = json!({ "table": "t", "column": "c", "top_values_limit": 10,
+            "include": { "distinct": true, "min_max": false, "top_values": true } });
+        let e = run(
+            "get_column_stats",
+            json!({ "params": { "host": "localhost" }, "request": request }),
+        )
+        .unwrap_err();
         assert!(e.message.contains("namespace/database"));
     }
 }

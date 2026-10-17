@@ -309,6 +309,13 @@ fn ends_with_ignore_case(s: &str, suffix: &str) -> bool {
 
 /// True when brackets in `sql` (outside strings and comments) balance and
 /// never close below zero.
+/// True when `sql` is one balanced expression with no second statement, so
+/// it can be embedded in another statement as `WHERE (<sql>\n)` without
+/// changing that statement's shape (used for the host's table filter).
+pub fn is_single_expression(sql: &str) -> bool {
+    is_balanced(sql) && split_statements(sql).len() <= 1
+}
+
 pub fn is_balanced(sql: &str) -> bool {
     let mut scanner = Scanner::new(sql);
     while scanner.next_event().is_some() {
@@ -648,5 +655,16 @@ mod tests {
         assert!(is_balanced("SELECT (1) FROM [a]"));
         assert!(!is_balanced("SELECT 1) FROM (2"));
         assert!(!is_balanced("SELECT ')"));
+    }
+
+    #[test]
+    fn single_expressions() {
+        assert!(is_single_expression("n > 2 AND s = 'a;b'"));
+        assert!(is_single_expression("`odd;name` = 1 -- trailing comment"));
+        assert!(is_single_expression(""));
+        assert!(!is_single_expression("1; DELETE item"));
+        assert!(!is_single_expression("1) OR (1"));
+        assert!(!is_single_expression("s = 'open"));
+        assert!(!is_single_expression("n > 1 /* unterminated"));
     }
 }

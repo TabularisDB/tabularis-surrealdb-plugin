@@ -918,3 +918,176 @@ fn query_timeout_is_enforced_with_actionable_errors() {
     let r = query(&mut p, &conn, "RETURN 'ok'");
     assert_eq!(r["rows"], json!([["ok"]]));
 }
+
+fn column_stats(
+    p: &mut Plugin,
+    conn: &Value,
+    table: &str,
+    column: &str,
+    filter: Value,
+    include: Value,
+) -> Result<Value, (i64, String)> {
+    p.call(
+        "get_column_stats",
+        json!({ "params": conn, "request": {
+            "table": table, "schema": null, "column": column, "data_type": null,
+            "filter": filter, "top_values_limit": 10, "include": include
+        }}),
+    )
+}
+
+#[test]
+fn column_statistics_respect_the_filter_and_the_requested_parts() {
+    let e = live!();
+    let mut p = Plugin::start();
+    let conn = connection(&e, &main_db(&e), "stats");
+    let all = json!({ "distinct": true, "min_max": true, "top_values": true });
+    query(
+        &mut p,
+        &conn,
+        "REMOVE TABLE IF EXISTS stats_probe; DEFINE TABLE stats_probe SCHEMALESS;\n\
+         CREATE stats_probe:1 SET k = 'a', d = d'2024-01-02T00:00:00Z', n = 5;\n\
+         CREATE stats_probe:2 SET k = 'a', n = 9;\n\
+         CREATE stats_probe:3 SET k = 'b', d = d'2023-05-01T00:00:00Z', n = 5;\n\
+         CREATE stats_probe:4 SET k = NULL, n = 1.5;\n\
+         CREATE stats_probe:5 SET `odd col` = 'x';",
+    );
+
+    // Every part: NONE (missing field) and NULL both count as NULL.
+    let r = column_stats(&mut p, &conn, "stats_probe", "k", Value::Null, all.clone()).unwrap();
+    assert_eq!(
+        r,
+        json!({
+            "row_count": 5, "null_count": 2, "distinct_count": 2, "min": "a", "max": "b",
+            "top_values": [{ "value": "a", "count": 2 }, { "value": "b", "count": 1 }]
+        })
+    );
+
+    // Numbers and datetimes: min / max in the column's own ordering.
+    let r = column_stats(&mut p, &conn, "stats_probe", "n", Value::Null, all.clone()).unwrap();
+    assert_eq!((r["min"].clone(), r["max"].clone()), (json!(1.5), json!(9)));
+    assert_eq!(r["top_values"][0], json!({ "value": 5, "count": 2 }));
+    let r = column_stats(&mut p, &conn, "stats_probe", "d", Value::Null, all.clone()).unwrap();
+    assert!(
+        r["min"]
+            .as_str()
+            .unwrap()
+            .starts_with("2023-05-01T00:00:00"),
+        "{r}"
+    );
+    assert!(
+        r["max"]
+            .as_str()
+            .unwrap()
+            .starts_with("2024-01-02T00:00:00"),
+        "{r}"
+    );
+    assert_eq!(r["null_count"], 3);
+
+    // The tab's filter narrows every count, as in the grid.
+    let r = column_stats(&mut p, &conn, "item", "n", json!("n > 20"), all.clone()).unwrap();
+    assert_eq!(
+        (
+            r["row_count"].clone(),
+            r["distinct_count"].clone(),
+            r["min"].clone(),
+            r["max"].clone()
+        ),
+        (json!(5), json!(5), json!(21), json!(25))
+    );
+    assert_eq!(r["top_values"].as_array().unwrap().len(), 5);
+    assert!(r.get("sample_size").is_none());
+    let r = column_stats(&mut p, &conn, "item", "n", json!("n > 1000"), all.clone()).unwrap();
+    assert_eq!(
+        r,
+        json!({ "row_count": 0, "null_count": 0, "distinct_count": 0, "min": null,
+                "max": null, "top_values": [] })
+    );
+
+    // A masked column asks for the distinct count only: no values come back.
+    let r = column_stats(
+        &mut p,
+        &conn,
+        "stats_probe",
+        "k",
+        Value::Null,
+        json!({ "distinct": true, "min_max": false, "top_values": false }),
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            r["distinct_count"].clone(),
+            r["min"].clone(),
+            r["top_values"].clone()
+        ),
+        (json!(2), Value::Null, Value::Null)
+    );
+
+    // Quoted names, and a filter that would end the statement is refused.
+    let r = column_stats(
+        &mut p,
+        &conn,
+        "odd table",
+        "odd field",
+        Value::Null,
+        all.clone(),
+    )
+    .unwrap();
+    assert_eq!(r["top_values"], json!([{ "value": "y", "count": 1 }]));
+    let (code, message) = column_stats(
+        &mut p,
+        &conn,
+        "item",
+        "n",
+        json!("1; DELETE item"),
+        all.clone(),
+    )
+    .unwrap_err();
+    assert_eq!(code, -32602);
+    assert!(message.contains("single SurrealQL condition"), "{message}");
+    assert_eq!(
+        query(&mut p, &conn, "SELECT count() FROM item GROUP ALL")["rows"],
+        json!([[25]])
+    );
+
+    // Server errors (here an unknown function in the filter) are reported.
+    let (_, message) =
+        column_stats(&mut p, &conn, "item", "n", json!("nope::fn(n)"), all).unwrap_err();
+    assert!(!message.is_empty());
+}
+
+#[test]
+fn column_statistics_sample_large_tables_and_keep_exact_counts() {
+    let e = live!();
+    let mut p = Plugin::start();
+    let conn = connection(&e, &main_db(&e), "stats-sample");
+    query(
+        &mut p,
+        &conn,
+        "REMOVE TABLE IF EXISTS stats_big; DEFINE TABLE stats_big SCHEMALESS;\n\
+         CREATE |stats_big:1..100010| SET n = 1 RETURN NONE;\n\
+         CREATE stats_big:x SET n = NULL RETURN NONE;",
+    );
+    let total = query(&mut p, &conn, "SELECT count() FROM stats_big GROUP ALL")["rows"][0][0]
+        .as_u64()
+        .unwrap();
+    assert!(total > 100_001, "{total}");
+
+    let r = column_stats(
+        &mut p,
+        &conn,
+        "stats_big",
+        "n",
+        Value::Null,
+        json!({ "distinct": true, "min_max": true, "top_values": true }),
+    )
+    .unwrap();
+    // Counts are exact; the value statistics come from the first 100 000
+    // non-NULL values, and the result says so.
+    assert_eq!(r["row_count"], total);
+    assert_eq!(r["null_count"], 1);
+    assert_eq!(r["sample_size"], 100_000);
+    assert_eq!(r["distinct_count"], 1);
+    assert_eq!(r["top_values"], json!([{ "value": 1, "count": 100_000 }]));
+    query(&mut p, &conn, "REMOVE TABLE stats_big");
+}

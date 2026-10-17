@@ -237,7 +237,7 @@ pub async fn execute_query(ctx: &Context, params: &Json) -> Result<Json, PluginE
 /// after it (plus a second, so a server-side `TIMEOUT` reports first). The
 /// script is one `query` call, so the bound covers all of it, not each
 /// statement; the error says so when there are several.
-async fn run(
+pub(crate) async fn run(
     ctx: &Context,
     config: &SessionConfig,
     sql: &str,
