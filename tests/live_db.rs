@@ -302,6 +302,86 @@ fn connects_and_authenticates() {
     );
 }
 
+/// Does `name` exist under `key` of `INFO FOR <level>`, asked on `conn`?
+fn defined(p: &mut Plugin, conn: &Value, level: &str, key: &str, name: &str) -> bool {
+    let r = query(
+        p,
+        conn,
+        &format!("RETURN '{name}' IN object::keys((INFO FOR {level}).{key})"),
+    );
+    r["rows"][0][0]
+        .as_bool()
+        .unwrap_or_else(|| panic!("INFO FOR {level}: {r}"))
+}
+
+#[test]
+fn missing_namespace_or_database_is_refused_and_not_created() {
+    let e = live!();
+    let mut p = Plugin::start();
+    let main = connection(&e, &main_db(&e), "ghost-check");
+    // An EDITOR on the namespace may define databases, so on 3.x a plain
+    // `use` would create the missing database for it.
+    query(
+        &mut p,
+        &main,
+        "DEFINE USER IF NOT EXISTS ns_editor ON NAMESPACE PASSWORD 'ns-editor-pass' ROLES EDITOR",
+    );
+
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let ghost_ns = format!("ghost_ns_{suffix}");
+    let ghost_db = format!("ghost_db_{suffix}");
+    let ns_missing = format!("The namespace '{ghost_ns}' does not exist");
+    let db_missing = format!("The database '{ghost_db}' does not exist");
+
+    let mut ns_editor = connection(&e, &format!("{}/{ghost_db}", e.ns), "ns-editor");
+    ns_editor["username"] = json!("ns_editor");
+    ns_editor["password"] = json!("ns-editor-pass");
+    let mut root_pinned = connection(&e, &format!("{ghost_ns}/{}", e.db), "root-pinned");
+    root_pinned["extra"] = json!({ "auth_level": "root" });
+
+    let cases = [
+        (
+            connection(&e, &format!("{ghost_ns}/{}", e.db), "g1"),
+            &ns_missing,
+        ),
+        (root_pinned, &ns_missing),
+        (connection(&e, &ghost_ns, "g2"), &ns_missing),
+        (
+            connection(&e, &format!("{}/{ghost_db}", e.ns), "g3"),
+            &db_missing,
+        ),
+        (ns_editor, &db_missing),
+    ];
+    for (conn, expected) in &cases {
+        // "Test connection", and the cached session other requests use.
+        for (method, params) in [
+            ("test_connection", json!({ "params": conn })),
+            ("ping", json!({ "params": conn })),
+            (
+                "execute_query",
+                json!({ "params": conn, "query": "INFO FOR DB", "page": 1 }),
+            ),
+            ("get_databases", json!({ "params": conn })),
+        ] {
+            let (_, message) = p.call(method, params).unwrap_err();
+            assert!(
+                message.starts_with(expected.as_str()) && message.contains("never creates"),
+                "{method} on {}: {message}",
+                conn["database"]
+            );
+        }
+    }
+
+    // Nothing was created on the server.
+    assert!(defined(&mut p, &main, "ROOT", "namespaces", &e.ns));
+    assert!(!defined(&mut p, &main, "ROOT", "namespaces", &ghost_ns));
+    assert!(defined(&mut p, &main, "NS", "databases", &e.db));
+    assert!(!defined(&mut p, &main, "NS", "databases", &ghost_db));
+}
+
 #[test]
 fn unreachable_server_is_reported() {
     let e = live!();

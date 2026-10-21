@@ -60,6 +60,10 @@ CBOR encoding. See [docs/DESIGN.md](docs/DESIGN.md#supported-surrealdb-versions)
 Use `wss://` (or `https://`) in Host for servers behind TLS, for example
 `wss://my-instance.aws-euw1.surreal.cloud`.
 
+The namespace and database must exist. The plugin checks this before
+selecting them and reports a missing one, instead of letting SurrealDB 3.x
+create it.
+
 Sign-in level: by default the plugin tries a database user, then a
 namespace user, then a root user, and reports every level it tried if all
 fail. Namespace and database users need the namespace (and database) in the

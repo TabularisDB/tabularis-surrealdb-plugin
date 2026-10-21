@@ -93,13 +93,33 @@ pub fn auth_error(config: &SessionConfig, attempts: &[(AuthLevel, RpcError)]) ->
     ))
 }
 
+/// Does a server message say the signed-in user may not do this?
+pub fn is_permission_denied(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("not enough permissions")
+        || lower.contains("not allowed")
+        || lower.contains("iam error")
+}
+
+/// The namespace or database to connect to does not exist. Worded like the
+/// server's own message, so [`with_hint`] adds the same hint to both.
+pub fn not_found(
+    kind: &str,
+    name: &str,
+    config: &SessionConfig,
+    signed_in_as: AuthLevel,
+) -> PluginError {
+    PluginError::internal(with_hint(
+        &format!("The {kind} '{name}' does not exist"),
+        config,
+        signed_in_as,
+    ))
+}
+
 /// Add a hint to a query or `use` failure when the cause is recognisable.
 pub fn with_hint(message: &str, config: &SessionConfig, signed_in_as: AuthLevel) -> String {
     let lower = message.to_ascii_lowercase();
-    if lower.contains("not enough permissions")
-        || lower.contains("not allowed")
-        || lower.contains("iam error")
-    {
+    if is_permission_denied(message) {
         return format!(
             "{message} (signed in as {}; this needs a user with more privileges, or a role such as EDITOR or OWNER)",
             level_description(signed_in_as, config)
@@ -107,12 +127,12 @@ pub fn with_hint(message: &str, config: &SessionConfig, signed_in_as: AuthLevel)
     }
     if lower.contains("namespace") && lower.contains("does not exist") {
         return format!(
-            "{message}. Check the namespace in the Database field (`namespace/database`); SurrealDB does not create it on read."
+            "{message}. Check the namespace in the Database field (`namespace/database`). The plugin only connects to an existing namespace and never creates one."
         );
     }
     if lower.contains("database") && lower.contains("does not exist") {
         return format!(
-            "{message}. Check the database in the Database field (`namespace/database`); SurrealDB does not create it on read."
+            "{message}. Check the database in the Database field (`namespace/database`). The plugin only connects to an existing database and never creates one."
         );
     }
     if lower.contains("specify a namespace") || lower.contains("specify a database") {
@@ -207,6 +227,15 @@ mod tests {
         assert!(perm.contains("signed in as database user `reader` on `app/main`"));
         let ns = with_hint("The namespace 'nope' does not exist", &c, AuthLevel::Root);
         assert!(ns.contains("Check the namespace"));
+        assert!(ns.contains("never creates one"));
+        let db = not_found("database", "ghost", &c, AuthLevel::Root);
+        assert!(db
+            .message
+            .starts_with("The database 'ghost' does not exist. Check the database"));
+        assert!(is_permission_denied(
+            "Anonymous access not allowed: Not enough permissions to perform this action"
+        ));
+        assert!(!is_permission_denied("The namespace 'x' does not exist"));
         let plain = with_hint("Parse error: unexpected token", &c, AuthLevel::Root);
         assert_eq!(plain, "Parse error: unexpected token");
     }

@@ -16,7 +16,9 @@ use ciborium::value::Value as Cbor;
 
 /// Open a fresh session (never a cached one, so the result reflects the
 /// current server and credentials), sign in, select the namespace/database
-/// and check that it can be read.
+/// and check that it can be read. A namespace or database that does not
+/// exist fails in [`Session::open`], before anything is selected, so the
+/// test never creates it.
 pub async fn test_connection(_ctx: &Context, params: &Json) -> Result<Json, PluginError> {
     let config = SessionConfig {
         connection_id: None,

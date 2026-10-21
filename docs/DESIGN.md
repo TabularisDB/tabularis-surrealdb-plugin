@@ -89,6 +89,34 @@ tried when all fail. `root`, `namespace`, `database`, `token` and `none`
 (servers started with `--unauthenticated`) pin the level. The connection form
 has no field for it yet; see "Open questions".
 
+Existing namespaces and databases only: on SurrealDB 3.x, the `use` RPC
+creates a namespace or database that does not exist when the signed-in user
+may define one (root users both, namespace OWNERs and EDITORs a database).
+2.x creates nothing, but the connection would look empty. So before `use`,
+a session checks what the signed-in level can see, in an order that never
+names a missing namespace in `use`:
+
+1. `INFO FOR ROOT` lists the namespaces. It needs no namespace selected.
+2. Only once the namespace is known to exist, `use` selects it alone (this
+   creates no database) and `INFO FOR NS` lists its databases.
+3. `use` selects the namespace and database.
+
+A missing namespace or database fails with "The namespace 'x' does not
+exist" (or database), the same text SurrealDB uses, plus a hint to check
+the Database field. This covers "Test connection" and every other request.
+A check the signed-in user may not run is skipped, and the server's own
+permissions decide. Checked against 3.2:
+
+- Root users: both checks run.
+- Namespace users cannot run `INFO FOR ROOT`, but they can only sign in to
+  a namespace that exists, and cannot create another one. `INFO FOR NS`
+  runs, so a missing database is refused (an EDITOR or OWNER would
+  otherwise create it).
+- Database users can run neither check. They can only sign in to a
+  database that exists (a missing one shows as a failed sign-in) and cannot
+  create a namespace or database.
+- Tokens and anonymous sessions get whichever checks their level allows.
+
 Isolation: a session is keyed by the full connection configuration,
 including the Tabularis `connection_id`. Two Tabularis connections never
 share a WebSocket, even with identical settings, so their sign-in, namespace,
@@ -121,8 +149,9 @@ SurrealDB server and its effects, if any, still apply. SurrealDB 2.x and
 `query_cancel` from 3.3.0. Using it is planned for milestone 2, behind a
 server version check and with a test against a 3.3 server.
 
-Connecting is bounded at 10 s and sign-in plus `use` at 15 s, so an
-unreachable or unresponsive server fails fast with a clear message. Queries
+Connecting is bounded at 10 s, and sign-in, the namespace/database check
+and `use` at 15 s each, so an unreachable or unresponsive server fails fast
+with a message that names the step that timed out. Queries
 have no plugin-side timeout; the host's call timeout applies.
 
 ## Discovery

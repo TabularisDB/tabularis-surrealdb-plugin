@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connection and database.
 - `test_connection` with actionable messages for unreachable servers, failed
   sign-in (listing every level tried) and missing permissions.
+- A namespace or database that does not exist is reported as not found and
+  never created (SurrealDB 3.x `use` would create it).
 - Discovery: `namespace/database` list, tables, declared fields of
   SCHEMAFULL tables, fields sampled from the first 100 records of
   SCHEMALESS tables, and indexes.

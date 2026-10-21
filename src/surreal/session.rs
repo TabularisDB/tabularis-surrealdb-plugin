@@ -11,8 +11,8 @@ use crate::surreal::client::{RpcClient, RpcError};
 use crate::surreal::errors;
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Bound on sign-in and `use`, so an unresponsive server fails the
-/// connection instead of hanging it.
+/// Bound on each handshake step (sign-in, the existence check, `use`), so an
+/// unresponsive server fails the connection instead of hanging it.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Result of one statement of a `query` call.
@@ -29,21 +29,106 @@ pub struct Session {
 }
 
 impl Session {
-    /// Connect, sign in and select the namespace/database.
+    /// Connect, sign in, check that the namespace/database exists and
+    /// select it.
     pub async fn open(config: &SessionConfig) -> Result<Self, PluginError> {
         let client = RpcClient::connect(&config.url, CONNECT_TIMEOUT)
             .await
             .map_err(|e| errors::connect_error(&config.url, &e))?;
-        let signed_in_as = bounded(sign_in(&client, config)).await??;
+        let signed_in_as = bounded("signing in", sign_in(&client, config)).await??;
         let session = Self {
             client,
             config: config.clone(),
             signed_in_as,
         };
         if config.namespace.is_some() {
-            bounded(session.use_target()).await??;
+            let target = config.target();
+            bounded(
+                &format!("checking that `{target}` exists"),
+                session.check_target_exists(),
+            )
+            .await??;
+            bounded(&format!("selecting `{target}`"), session.use_target()).await??;
         }
         Ok(session)
+    }
+
+    /// Refuse a namespace or database that does not exist, without creating
+    /// it.
+    ///
+    /// On SurrealDB 3.x, `use` creates a missing namespace or database when
+    /// the signed-in user may define one: root users get both, namespace
+    /// OWNERs and EDITORs get a database. (2.x creates nothing, but the
+    /// connection would then look empty.) So `use` never names anything
+    /// that has not been seen to exist:
+    ///
+    /// 1. `INFO FOR ROOT`, which needs no namespace, lists the namespaces.
+    ///    Users below root may not run it; they cannot create a namespace
+    ///    either, and a namespace or database user only signs in to a
+    ///    namespace that exists.
+    /// 2. Only then `use` selects the namespace alone, and `INFO FOR NS`
+    ///    lists its databases. Database users may not run it; they cannot
+    ///    create a database either, and only sign in to one that exists.
+    ///
+    /// When a check is not allowed it is skipped and the server's own
+    /// permissions decide.
+    async fn check_target_exists(&self) -> Result<(), PluginError> {
+        let Some(ns) = &self.config.namespace else {
+            return Ok(());
+        };
+        if let Some(names) = self.info_names("INFO FOR ROOT", "namespaces").await? {
+            if !names.contains(ns) {
+                return Err(errors::not_found(
+                    "namespace",
+                    ns,
+                    &self.config,
+                    self.signed_in_as,
+                ));
+            }
+        }
+        let Some(db) = &self.config.database else {
+            return Ok(());
+        };
+        self.client
+            .call("use", vec![Cbor::Text(ns.clone()), Cbor::Null])
+            .await
+            .map_err(|e| self.rpc_error(e))?;
+        if let Some(names) = self.info_names("INFO FOR NS", "databases").await? {
+            if !names.contains(db) {
+                return Err(errors::not_found(
+                    "database",
+                    db,
+                    &self.config,
+                    self.signed_in_as,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Names under `key` in the result of an `INFO FOR …` statement. `None`
+    /// when the signed-in user may not run it, or the result has no such
+    /// key, so the caller cannot tell either way.
+    async fn info_names(&self, sql: &str, key: &str) -> Result<Option<Vec<String>>, PluginError> {
+        let info = match self.query(sql, vec![]).await {
+            Ok(outcomes) => match outcomes.into_iter().next() {
+                Some(StatementOutcome::Ok(info)) => info,
+                Some(StatementOutcome::Err(m)) if errors::is_permission_denied(&m) => {
+                    return Ok(None)
+                }
+                Some(StatementOutcome::Err(m)) => return Err(PluginError::internal(self.hint(&m))),
+                None => return Ok(None),
+            },
+            // 3.x rejects the whole call for anonymous sessions.
+            Err(RpcError::Server(e))
+                if e.kind.as_deref() == Some("NotAllowed")
+                    || errors::is_permission_denied(&e.message) =>
+            {
+                return Ok(None)
+            }
+            Err(e) => return Err(self.rpc_error(e)),
+        };
+        Ok(definition_keys(&info, key))
     }
 
     pub fn is_closed(&self) -> bool {
@@ -148,17 +233,38 @@ impl Session {
     }
 }
 
+/// Run one handshake step under [`HANDSHAKE_TIMEOUT`]; `stage` names the
+/// step in the timeout message ("while {stage}").
 async fn bounded<T>(
+    stage: &str,
     fut: impl std::future::Future<Output = Result<T, PluginError>>,
 ) -> Result<Result<T, PluginError>, PluginError> {
     tokio::time::timeout(HANDSHAKE_TIMEOUT, fut)
         .await
-        .map_err(|_| {
-            PluginError::internal(format!(
-                "SurrealDB did not answer within {}s while signing in.",
-                HANDSHAKE_TIMEOUT.as_secs()
-            ))
-        })
+        .map_err(|_| timeout_error(stage))
+}
+
+fn timeout_error(stage: &str) -> PluginError {
+    PluginError::internal(format!(
+        "SurrealDB did not answer within {}s while {stage}.",
+        HANDSHAKE_TIMEOUT.as_secs()
+    ))
+}
+
+/// Keys of the definition map `key` (`namespaces`, `databases`, …) of an
+/// `INFO FOR …` result; `None` when there is no such map.
+fn definition_keys(info: &Cbor, key: &str) -> Option<Vec<String>> {
+    let Cbor::Map(entries) = info else {
+        return None;
+    };
+    let (_, Cbor::Map(defs)) = entries.iter().find(|(k, _)| k.as_text() == Some(key))? else {
+        return None;
+    };
+    Some(
+        defs.iter()
+            .filter_map(|(name, _)| name.as_text().map(str::to_string))
+            .collect(),
+    )
 }
 
 async fn sign_in(client: &RpcClient, config: &SessionConfig) -> Result<AuthLevel, PluginError> {
@@ -340,6 +446,28 @@ mod tests {
         );
         assert!(matches!(&out[2], StatementOutcome::Ok(Cbor::Tag(6, _))));
         assert!(parse_query_response(Cbor::Null).is_err());
+    }
+
+    #[test]
+    fn reads_definition_keys() {
+        let info = map(vec![(
+            "namespaces",
+            map(vec![("app", Cbor::Text("DEFINE NAMESPACE app".into()))]),
+        )]);
+        assert_eq!(
+            definition_keys(&info, "namespaces"),
+            Some(vec!["app".into()])
+        );
+        assert_eq!(definition_keys(&info, "databases"), None);
+        assert_eq!(definition_keys(&Cbor::Null, "namespaces"), None);
+    }
+
+    #[test]
+    fn timeouts_name_the_stage() {
+        assert_eq!(
+            timeout_error("selecting `app/main`").message,
+            "SurrealDB did not answer within 15s while selecting `app/main`."
+        );
     }
 
     #[test]
