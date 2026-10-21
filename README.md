@@ -34,7 +34,9 @@ Design decisions and their evidence are in [docs/DESIGN.md](docs/DESIGN.md).
 - Record ids are shown as `table:id` text you can paste back into a query.
   Objects and arrays open in the JSON viewer. Decimals and large integers
   keep their exact digits.
-- Read-only: grid edits and schema changes are disabled.
+- Read-only: grid edits and schema changes are disabled. SurrealQL typed
+  in the editor runs with your user's own permissions, so editor queries
+  can still write.
 
 ## Supported SurrealDB versions
 

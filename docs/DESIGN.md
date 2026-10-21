@@ -173,6 +173,11 @@ have no plugin-side timeout; the host's call timeout applies.
 - Indexes: `INFO FOR TABLE`, one entry per indexed field, with `UNIQUE`.
 - Foreign keys: not reported yet (record links and relations could be,
   milestone 2).
+- Autocomplete (`get_all_columns_batch`) runs `INFO FOR DB; INFO FOR TABLE`
+  and, for SCHEMALESS tables, the 100-record sample for every table, one
+  table after the other. On a database with many SCHEMALESS tables this is
+  slow. Milestone 2: run the per-table requests concurrently (bounded), or
+  fetch all table definitions in one script.
 
 ## Table browsing and query templates
 
