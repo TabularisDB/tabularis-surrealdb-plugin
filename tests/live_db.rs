@@ -303,15 +303,18 @@ fn connects_and_authenticates() {
 }
 
 /// Does `name` exist under `key` of `INFO FOR <level>`, asked on `conn`?
+/// Read from the plain statement's result: 2.x cannot parse `INFO` as a
+/// subquery.
 fn defined(p: &mut Plugin, conn: &Value, level: &str, key: &str, name: &str) -> bool {
-    let r = query(
-        p,
-        conn,
-        &format!("RETURN '{name}' IN object::keys((INFO FOR {level}).{key})"),
-    );
-    r["rows"][0][0]
-        .as_bool()
-        .unwrap_or_else(|| panic!("INFO FOR {level}: {r}"))
+    let r = query(p, conn, &format!("INFO FOR {level}"));
+    let column = column_names(&r)
+        .iter()
+        .position(|c| c == key)
+        .unwrap_or_else(|| panic!("INFO FOR {level} has no {key}: {r}"));
+    r["rows"][0][column]
+        .as_object()
+        .unwrap_or_else(|| panic!("INFO FOR {level}.{key}: {r}"))
+        .contains_key(name)
 }
 
 #[test]
