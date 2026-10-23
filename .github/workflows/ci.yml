@@ -84,8 +84,13 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   live-db-integration:
-    name: Live SurrealDB integration
+    name: Live SurrealDB integration (${{ matrix.surrealdb }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The plugin targets 2.x and 3.x; run the live test against both.
+        surrealdb: [v2, v3]
     steps:
       - uses: actions/checkout@v7
 
@@ -93,7 +98,7 @@ jobs:
       # image needs a `start` command, which `services:` cannot pass.
       - name: Start SurrealDB
         run: |
-          docker run -d --name surrealdb -p 8000:8000 surrealdb/surrealdb:v2 \
+          docker run -d --name surrealdb -p 8000:8000 surrealdb/surrealdb:${{ matrix.surrealdb }} \
             start --user root --pass root memory
           for i in $(seq 1 30); do
             curl -sf http://127.0.0.1:8000/health && exit 0
