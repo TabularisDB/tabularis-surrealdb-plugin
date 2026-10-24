@@ -35,7 +35,7 @@ Status: **M1** = milestone 1 (PR #1), **M2** = this milestone, **deferred**
 | `get_tables`, `get_columns`, `get_indexes`, `get_all_columns_batch` | M1 | `discovers_databases…` |
 | `get_foreign_keys`, `get_all_foreign_keys_batch` | M2: `record<t>` fields and relation `in`/`out` | `record_links_are_foreign_keys_and_navigable`, `handlers::metadata` tests |
 | `get_schema_snapshot`, `get_ai_schema_context` | `-32601` by design: the host composes them from the methods above | `unknown_methods_are_method_not_found` |
-| `execute_query` | M1; M2: NONE-only statements skipped, affected rows, server time, timeout | `runs_native_surrealql`, `result_shapes_writes_and_empty_results` |
+| `execute_query` | M1; M2: statements that never return data skipped (by keyword), affected rows, server time, timeout | `runs_native_surrealql`, `result_shapes_writes_and_empty_results` |
 | `execute_query_batch` | M2: one script, one result or error per statement | `batches_run_as_one_script…`, `handlers::query` batch tests |
 | `session_id`, `release_session` | `session_id` accepted and ignored; `release_session` answers `-32601`, which the host tolerates. Deferred: transactions that span separate runs (SurrealDB transactions live inside one `query` call; 3.x interactive transactions need the `begin`/`commit` RPC) | — |
 | `cancel` notification | M1: local only; server-side `query_cancel` (3.3+) deferred, see Cancellation | `cancel_stops_waiting…` |
@@ -315,9 +315,23 @@ host would assume PostgreSQL quoting.
 | NONE (`LET`, `DEFINE`, …) | no columns, no rows |
 
 Scripts in one `execute_query` call (notebook cells, a single editor
-statement the host did not split): statements that return NONE (`LET`,
-`DEFINE`, `USE`, `BEGIN`, `COMMIT`, …) produce no result set. The first
-remaining result is the primary one, which is what a notebook cell shows;
+statement the host did not split): statements that never return data
+produce no result set. They are recognised by their first keyword, not by a
+NONE result, because the servers differ (3.x answers `USE` with the
+selected namespace and database, 2.x with NONE) and the shape of the
+response must not depend on the version:
+
+| Kind | Keywords |
+|---|---|
+| session | `USE`, `LET`, `OPTION` |
+| transaction | `BEGIN`, `COMMIT`, `CANCEL` |
+| schema | `DEFINE`, `REMOVE`, `ALTER`, `REBUILD` |
+| code without a value | `FOR`, `SLEEP`, `KILL` |
+
+Any other statement keeps its result, even NONE (`RETURN NONE`, an `IF`
+without `ELSE`): the user asked for a value. When the plugin's statement
+count disagrees with the server's, NONE results are left out instead. The
+first remaining result is the primary one, which is what a notebook cell shows;
 the others go to `additional_results` (result tabs in the editor). A failed
 statement fails the call and is named ("Statement 2 of 3 failed: …"),
 because a notebook cell has a single error slot and hiding the error behind

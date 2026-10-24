@@ -641,7 +641,10 @@ fn connections_do_not_share_namespace_or_database() {
         &a,
         &format!("USE DB `{target}`; SELECT db FROM marker:here"),
     );
-    assert_eq!(r["additional_results"][0]["rows"][0][0], "iso");
+    // USE produces no result set on 2.x and 3.x alike: the SELECT is the
+    // primary result.
+    assert_eq!(r["rows"][0][0], "iso", "{r}");
+    assert!(r.get("additional_results").is_none(), "{r}");
     let r = query(&mut p, &a, "SELECT db FROM marker:here");
     assert_eq!(r["rows"][0][0], "main");
 }

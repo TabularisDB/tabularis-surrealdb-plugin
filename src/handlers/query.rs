@@ -99,6 +99,17 @@ pub struct Plan {
 /// Statements whose returned records are the records they changed.
 const WRITE_KEYWORDS: &[&str] = &["CREATE", "INSERT", "UPDATE", "UPSERT", "DELETE", "RELATE"];
 
+/// Statements that never return data: they change the session (`USE`,
+/// `LET`, `OPTION`), the transaction (`BEGIN`, `COMMIT`, `CANCEL`) or the
+/// schema (`DEFINE`, `REMOVE`, `ALTER`, `REBUILD`), or only run code
+/// (`FOR`, `SLEEP`, `KILL`). In a script they produce no result set, decided
+/// by keyword so the shape is the same on every server version (3.x answers
+/// `USE` with the selected namespace and database, 2.x with NONE).
+const NO_RESULT_KEYWORDS: &[&str] = &[
+    "USE", "LET", "OPTION", "BEGIN", "COMMIT", "CANCEL", "DEFINE", "REMOVE", "ALTER", "REBUILD",
+    "FOR", "SLEEP", "KILL",
+];
+
 /// Statements that SurrealDB 2.x runs without adding an entry to the `query`
 /// response. 3.x answers every statement.
 const UNANSWERED_ON_2X: &[&str] = &["BEGIN", "COMMIT", "CANCEL", "OPTION"];
@@ -339,10 +350,12 @@ fn statement_result(value: Cbor, plan: Option<&StatementPlan>, time_ms: Option<f
 ///
 /// - A failed statement fails the call, naming the statement when there are
 ///   several (the host has one error slot per call).
-/// - With several statements, the ones that return nothing (NONE: `LET`,
-///   `DEFINE`, `USE`, `BEGIN`, …) produce no result set. The first remaining
-///   result is the primary one, which is what a notebook cell shows; the
-///   rest go to `additional_results` (result tabs in the editor).
+/// - With several statements, the ones that never return data
+///   ([`NO_RESULT_KEYWORDS`]: `LET`, `DEFINE`, `USE`, `BEGIN`, …) produce no
+///   result set, whatever the server answered. The first remaining result
+///   is the primary one, which is what a notebook cell shows; the rest go to
+///   `additional_results` (result tabs in the editor). Without alignment,
+///   NONE results are left out instead.
 pub fn build_response(
     outcomes: Vec<TimedOutcome>,
     plans: &[StatementPlan],
@@ -380,10 +393,17 @@ pub fn build_response(
         let StatementOutcome::Ok(value) = timed.outcome else {
             unreachable!("errors returned above")
         };
-        if total > 1 && is_none(&value) {
+        let plan = if aligned { Some(answered[i].1) } else { None };
+        let no_result = match plan {
+            Some(p) => p
+                .keyword
+                .as_deref()
+                .is_some_and(|k| NO_RESULT_KEYWORDS.contains(&k)),
+            None => is_none(&value),
+        };
+        if total > 1 && no_result {
             continue;
         }
-        let plan = if aligned { Some(answered[i].1) } else { None };
         results.push(statement_result(value, plan, timed.time_ms));
     }
     if results.is_empty() {
@@ -884,5 +904,38 @@ mod tests {
             "{}",
             e.message
         );
+    }
+
+    #[test]
+    fn scripts_skip_statements_by_keyword_not_by_value() {
+        let text = |t: &str| Cbor::Text(t.into());
+        // 3.x answers USE with the selected namespace and database.
+        let used = Cbor::Map(vec![
+            (text("namespace"), text("app")),
+            (text("database"), text("iso")),
+        ]);
+        let r = respond(
+            vec![ok(used), ok(records(1))],
+            &plans_for("USE DB iso; SELECT * FROM t"),
+        )
+        .unwrap();
+        assert_eq!(r["rows"], json!([[0]]), "the SELECT is the primary result");
+        assert!(r.get("additional_results").is_none());
+        // 2.x answers it with NONE: same shape.
+        let r = respond(
+            vec![ok(none()), ok(records(1))],
+            &plans_for("USE DB iso; SELECT * FROM t"),
+        )
+        .unwrap();
+        assert_eq!(r["rows"], json!([[0]]));
+        assert!(r.get("additional_results").is_none());
+        // A statement the user asked a value of keeps its result, even NONE.
+        let r = respond(
+            vec![ok(none()), ok(Cbor::Integer(1.into()))],
+            &plans_for("RETURN NONE; RETURN 1"),
+        )
+        .unwrap();
+        assert_eq!(r["columns"], json!([]));
+        assert_eq!(r["additional_results"][0]["rows"], json!([[1]]));
     }
 }
