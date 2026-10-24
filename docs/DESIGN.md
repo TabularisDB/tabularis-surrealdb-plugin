@@ -344,7 +344,9 @@ variables and `BEGIN … COMMIT` work across them, and returns one result or
 error per statement: an error stays with its statement and the others still
 show. The host splits with a generic SQL splitter that can cut a SurrealQL
 block (`{ …; … }`); joined again it is one statement, whose result goes to
-the piece where it ends while the other pieces show an empty result. Each
+the piece where it ends while the other pieces show an empty result. A
+piece with unbalanced brackets is never paginated, even when it starts with
+SELECT, since a `LIMIT` after it would land inside or after the block. Each
 result carries the server's execution time (`execution_time_ms`, and
 `server_time_ms` on the result).
 

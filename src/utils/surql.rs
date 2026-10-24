@@ -120,8 +120,12 @@ const NO_PUSHDOWN_KEYWORDS: &[&str] = &[
 ];
 
 /// True when `LIMIT n START m` can be appended to this statement as-is.
+/// A statement with unbalanced brackets is a piece of a block that the
+/// host's splitter cut (`… { LET $a = 1` / `SELECT … }`): a clause after it
+/// would land inside or after the block, so it is never paginated.
 pub fn can_push_down_pagination(statement: &Statement<'_>) -> bool {
     statement.first_keyword() == Some("SELECT")
+        && is_balanced(statement.text)
         && !NO_PUSHDOWN_KEYWORDS
             .iter()
             .any(|k| statement.has_top_level_keyword(k))
@@ -305,7 +309,7 @@ fn ends_with_ignore_case(s: &str, suffix: &str) -> bool {
 
 /// True when brackets in `sql` (outside strings and comments) balance and
 /// never close below zero.
-fn is_balanced(sql: &str) -> bool {
+pub fn is_balanced(sql: &str) -> bool {
     let mut scanner = Scanner::new(sql);
     while scanner.next_event().is_some() {
         if scanner.underflow {
@@ -533,6 +537,9 @@ mod tests {
         assert!(!check("RETURN 1"));
         assert!(!check("CREATE person CONTENT {}"));
         assert!(check("SELECT * FROM (SELECT * FROM person LIMIT 50)"));
+        // Pieces of a block the host's splitter cut.
+        assert!(!check("SELECT * FROM item WHERE n >= $m }"));
+        assert!(!check("SELECT * FROM { LET $a = 1"));
     }
 
     #[test]

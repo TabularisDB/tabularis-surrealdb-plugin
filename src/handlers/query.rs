@@ -23,8 +23,8 @@ use crate::surreal::session::{Session, StatementOutcome, TimedOutcome};
 use crate::surreal::{retry_class, Retry};
 use crate::utils::pagination::{offset_for, slice_page};
 use crate::utils::surql::{
-    can_push_down_pagination, normalize_host_browse_query, split_statements, with_pagination,
-    Statement,
+    can_push_down_pagination, is_balanced, normalize_host_browse_query, split_statements,
+    with_pagination, Statement,
 };
 use crate::utils::values::is_none;
 use ciborium::value::Value as Cbor;
@@ -195,7 +195,10 @@ fn single_statement(
     page: u64,
     timeout_secs: Option<u64>,
 ) -> (String, PageMode) {
-    match (statement.first_keyword() == Some("SELECT"), limit) {
+    // A piece of a block the host's splitter cut is not a SELECT of its own,
+    // even when it starts with one.
+    let select = statement.first_keyword() == Some("SELECT") && is_balanced(statement.text);
+    match (select, limit) {
         (true, Some(size)) if can_push_down_pagination(statement) => {
             let offset = offset_for(page, size);
             (
@@ -843,6 +846,18 @@ mod tests {
         assert!(out[0]["error"].is_null());
         assert_eq!(out[1]["result"]["columns"], json!([]), "NONE from DEFINE");
         assert_eq!(out[2]["result"]["rows"], json!([[2]]));
+    }
+
+    #[test]
+    fn batch_never_paginates_a_piece_of_a_cut_block() {
+        let (script, entries, _) = batch(&[
+            "DEFINE FUNCTION OVERWRITE fn::f() { LET $m = 1",
+            "SELECT * FROM item WHERE n >= $m }",
+            "RETURN fn::f()",
+        ]);
+        assert!(!script.contains("LIMIT"), "{script}");
+        assert_eq!(entries[1].plans[0].mode, PageMode::None);
+        assert_eq!(split_statements(&script).len(), 2);
     }
 
     #[test]

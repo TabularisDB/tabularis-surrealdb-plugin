@@ -797,6 +797,20 @@ fn batches_run_as_one_script_with_per_statement_results() {
     assert!(out.iter().all(|o| o["error"].is_null()), "{out:?}");
     assert_eq!(out[3]["result"]["rows"], json!([[2]]));
 
+    // A cut block whose second piece starts with SELECT is not paginated
+    // (a LIMIT after the `}` failed the whole script).
+    let out = run(
+        &mut p,
+        json!([
+            "DEFINE FUNCTION OVERWRITE fn::f() { LET $m = 9",
+            "SELECT n FROM item WHERE n >= $m }",
+            "RETURN fn::f()"
+        ]),
+    );
+    let out = out.as_array().unwrap();
+    assert_eq!(out.len(), 3);
+    assert!(out.iter().all(|o| o["error"].is_null()), "{out:?}");
+
     // A transaction across statements.
     let out = run(
         &mut p,
