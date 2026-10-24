@@ -422,9 +422,11 @@ Only the parts the host asked for are added. Choices:
   `RETURN` takes no `TIMEOUT`; it works on the sample in `$values`, at most
   100 000 values.
 
-Verified live on 3.2.3 (`column_statistics_respect_the_filter_and_the_requested_parts`,
+Verified live on 2.7.0, 3.2.3 and 3.2.6
+(`column_statistics_respect_the_filter_and_the_requested_parts`,
 `column_statistics_sample_large_tables_and_keep_exact_counts` with over 100 000
-rows). CI runs the same live tests on v2.
+rows, and the statistics part of `query_timeout_is_enforced_with_actionable_errors`).
+CI runs the same live tests on v2 and v3.
 
 ## Result mapping
 
