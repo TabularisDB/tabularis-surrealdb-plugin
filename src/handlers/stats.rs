@@ -16,7 +16,12 @@
 //!    column has more non-NULL values than the sample, the result says so
 //!    with `sample_size`.
 //!
+//! With a query timeout set, every SELECT carries `TIMEOUT <n>s`, so the
+//! server stops the work itself; the popover never cancels.
+//!
 //! See docs/DESIGN.md, "Column statistics".
+
+use std::time::Duration;
 
 use ciborium::value::Value as Cbor;
 use serde_json::{json, Value as Json};
@@ -26,7 +31,7 @@ use crate::handlers::query::run;
 use crate::handlers::{require_database, session_config, Context};
 use crate::surreal::session::StatementOutcome;
 use crate::utils::identifiers::quote_identifier;
-use crate::utils::surql::is_single_expression;
+use crate::utils::surql::{is_single_expression, split_statements};
 use crate::utils::values::{is_none, to_cell};
 
 /// Non-NULL values the distinct count, min / max and top values are
@@ -101,13 +106,17 @@ impl StatsRequest {
 /// The SurrealQL script for `request`, sampling at most `sample_size`
 /// non-NULL values. Identifiers are always quoted. The filter goes in
 /// brackets, followed by a newline so a trailing `--` comment can't swallow
-/// the closing bracket.
-pub fn build_script(request: &StatsRequest, sample_size: u64) -> String {
+/// the closing bracket. With `timeout_secs`, every SELECT ends in
+/// `TIMEOUT <n>s` (the last clause of a SELECT), so the server stops it.
+pub fn build_script(request: &StatsRequest, sample_size: u64, timeout_secs: Option<u64>) -> String {
     let table = quote_identifier(&request.table);
     let col = quote_identifier(&request.column);
     let filter = request.filter.as_deref().map(|f| format!("({f}\n)"));
+    let timeout = timeout_secs
+        .map(|t| format!(" TIMEOUT {t}s"))
+        .unwrap_or_default();
     let mut script = format!(
-        "SELECT count() AS rows, count(({col} = NONE) OR ({col} = NULL)) AS nulls FROM {table}{} GROUP ALL;",
+        "SELECT count() AS rows, count(({col} = NONE) OR ({col} = NULL)) AS nulls FROM {table}{} GROUP ALL{timeout};",
         filter
             .as_deref()
             .map(|f| format!(" WHERE {f}"))
@@ -122,7 +131,7 @@ pub fn build_script(request: &StatsRequest, sample_size: u64) -> String {
         None => not_null,
     };
     script.push_str(&format!(
-        "\nLET $values = (SELECT {col} AS v FROM {table} WHERE {condition} LIMIT {sample_size});"
+        "\nLET $values = (SELECT {col} AS v FROM {table} WHERE {condition} LIMIT {sample_size}{timeout});"
     ));
     let mut fields = vec!["sampled: array::len($values)".to_string()];
     if request.distinct {
@@ -138,7 +147,7 @@ pub fn build_script(request: &StatsRequest, sample_size: u64) -> String {
         // SELECT that groups and returns the groups ordered by `v`, so the
         // LIMIT would keep the wrong values.
         script.push_str(&format!(
-            "\nSELECT * FROM (SELECT v, count() AS count FROM $values GROUP BY v) ORDER BY count DESC, v ASC LIMIT {};",
+            "\nSELECT * FROM (SELECT v, count() AS count FROM $values GROUP BY v) ORDER BY count DESC, v ASC LIMIT {}{timeout};",
             request.top_values_limit
         ));
     }
@@ -244,11 +253,25 @@ pub async fn get_column_stats(ctx: &Context, params: &Json) -> Result<Json, Plug
     let config = session_config(params)?;
     require_database(&config)?;
     let request = StatsRequest::from_params(params)?;
-    let script = build_script(&request, SAMPLE_SIZE);
     let timeout = ctx.settings().query_timeout_secs;
+    let script = build_script(&request, SAMPLE_SIZE, timeout);
+    // Each statement is stopped by the server at the timeout, so the script
+    // can take that long per statement. The local bound only catches a
+    // server that does not answer, and leaves a second for the server's own
+    // timeout error to arrive first.
+    let work = run(ctx, &config, &script, false, None);
     // The script has no BEGIN/COMMIT/CANCEL/OPTION: every version answers
     // each statement.
-    let (outcomes, _) = run(ctx, &config, &script, false, timeout).await?;
+    let (outcomes, _) = match timeout {
+        None => work.await?,
+        Some(secs) => {
+            let statements = split_statements(&script).len() as u64;
+            let bound = secs.saturating_mul(statements).saturating_add(1);
+            tokio::time::timeout(Duration::from_secs(bound), work)
+                .await
+                .map_err(|_| stats_timeout_error(bound))??
+        }
+    };
     let values = outcomes
         .into_iter()
         .map(|timed| match timed.outcome {
@@ -257,6 +280,12 @@ pub async fn get_column_stats(ctx: &Context, params: &Json) -> Result<Json, Plug
         })
         .collect::<Result<Vec<_>, _>>()?;
     build_result(&request, &values, SAMPLE_SIZE)
+}
+
+fn stats_timeout_error(bound: u64) -> PluginError {
+    PluginError::internal(format!(
+        "SurrealDB did not answer the column statistics within {bound}s. Every statement of it carries the plugin's query timeout, so the server stops them itself; check that the server is responsive."
+    ))
 }
 
 #[cfg(test)]
@@ -338,12 +367,22 @@ mod tests {
     #[test]
     fn script_with_filter_and_every_part() {
         assert_eq!(
-            build_script(&request(Some("n > 2")), 1000),
+            build_script(&request(Some("n > 2")), 1000, None),
             "SELECT count() AS rows, count((`n` = NONE) OR (`n` = NULL)) AS nulls FROM `item` WHERE (n > 2\n) GROUP ALL;\n\
              LET $values = (SELECT `n` AS v FROM `item` WHERE (n > 2\n) AND `n` != NONE AND `n` != NULL LIMIT 1000);\n\
              RETURN { sampled: array::len($values), distinct: array::len(array::distinct($values.v)), min: array::min($values.v), max: array::max($values.v) };\n\
              SELECT * FROM (SELECT v, count() AS count FROM $values GROUP BY v) ORDER BY count DESC, v ASC LIMIT 10;"
         );
+    }
+
+    #[test]
+    fn every_select_carries_the_query_timeout() {
+        let script = build_script(&request(None), 1000, Some(30));
+        assert_eq!(script.matches(" TIMEOUT 30s").count(), 3, "{script}");
+        assert!(script.contains("GROUP ALL TIMEOUT 30s;"));
+        assert!(script.contains("LIMIT 1000 TIMEOUT 30s);"));
+        assert!(script.contains("v ASC LIMIT 10 TIMEOUT 30s;"));
+        assert!(stats_timeout_error(121).message.contains("121s"));
     }
 
     #[test]
@@ -357,7 +396,7 @@ mod tests {
             ..request(None)
         };
         assert_eq!(
-            build_script(&counts_only, 1000),
+            build_script(&counts_only, 1000, None),
             "SELECT count() AS rows, count((`a\\`b` = NONE) OR (`a\\`b` = NULL)) AS nulls FROM `odd table` GROUP ALL;"
         );
         let masked = StatsRequest {
@@ -365,7 +404,7 @@ mod tests {
             top_values: false,
             ..request(None)
         };
-        let script = build_script(&masked, 1000);
+        let script = build_script(&masked, 1000, None);
         assert!(script.contains("RETURN { sampled: array::len($values), distinct:"));
         assert!(!script.contains("array::min") && !script.contains("GROUP BY v"));
     }

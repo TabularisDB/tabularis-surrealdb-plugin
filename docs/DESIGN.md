@@ -343,8 +343,7 @@ The request names the table and column (unquoted), the tab's filter (a
 SurrealQL condition, as typed in the grid), a top-N limit and which parts to
 compute. The host never asks for min / max or top values of a masked column,
 and drops them anyway if they come back. The plugin sends one script in one
-`query` call, on the connection's session, bounded by the query timeout
-setting like any other query:
+`query` call, on the connection's session:
 
 ```sql
 SELECT count() AS rows, count((`c` = NONE) OR (`c` = NULL)) AS nulls
@@ -389,6 +388,15 @@ Only the parts the host asked for are added. Choices:
   `-32602` instead of being spliced into the script.
 - **Empty results.** 2.x returns no row for a `GROUP ALL` over nothing, 3.x
   a zero row; both read as 0.
+- **Timeout.** With the query timeout setting on, every SELECT of the
+  script (the counts, the sample inside `LET`, the top values) ends in
+  `TIMEOUT <n>s`, so the server stops it and answers with its timeout
+  error. The popover never cancels a request, so a timeout that only
+  stopped the plugin from waiting would leave a full `count() … GROUP ALL`
+  running on a big table. The plugin waits at most `<n>` seconds per
+  statement plus one, which only matters for a server that does not answer.
+  `RETURN` takes no `TIMEOUT`; it works on the sample in `$values`, at most
+  100 000 values.
 
 Verified live on 3.2.3 (`column_statistics_respect_the_filter_and_the_requested_parts`,
 `column_statistics_sample_large_tables_and_keep_exact_counts` with over 100 000

@@ -903,6 +903,21 @@ fn query_timeout_is_enforced_with_actionable_errors() {
     );
     assert!(started.elapsed() < Duration::from_secs(5));
 
+    // Column statistics carry the same TIMEOUT: the server stops them too,
+    // rather than counting on after the popover gave up.
+    let started = Instant::now();
+    let (_, message) = column_stats(
+        &mut p,
+        &conn,
+        "item",
+        "n",
+        json!("sleep(100ms) = NONE"),
+        json!({ "distinct": true }),
+    )
+    .unwrap_err();
+    assert!(message.contains("exceeded the timeout"), "{message}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+
     // Anything else: the plugin stops waiting after the timeout (+1s).
     let started = Instant::now();
     let (_, message) = p
