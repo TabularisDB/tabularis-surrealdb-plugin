@@ -234,7 +234,9 @@ pub async fn execute_query(ctx: &Context, params: &Json) -> Result<Json, PluginE
 /// [`Answers`]). A query with `USE` runs on a session of its own, since
 /// `USE` would switch the shared session's namespace/database under
 /// concurrent requests. With a query timeout set, the plugin stops waiting
-/// after it (plus a second, so a server-side `TIMEOUT` reports first).
+/// after it (plus a second, so a server-side `TIMEOUT` reports first). The
+/// script is one `query` call, so the bound covers all of it, not each
+/// statement; the error says so when there are several.
 async fn run(
     ctx: &Context,
     config: &SessionConfig,
@@ -277,15 +279,21 @@ async fn run(
         Some(secs) => {
             tokio::time::timeout(Duration::from_secs(secs) + Duration::from_secs(1), work)
                 .await
-                .map_err(|_| local_timeout_error(secs))?
+                .map_err(|_| local_timeout_error(secs, split_statements(sql).len()))?
         }
     }
 }
 
-pub fn local_timeout_error(secs: u64) -> PluginError {
-    PluginError::internal(format!(
-        "SurrealDB did not answer within the plugin's query timeout ({secs}s). The plugin stopped waiting, but the statement may still be running on the server. Raise or disable it in the SurrealDB plugin settings, or add a TIMEOUT clause to the statement."
-    ))
+pub fn local_timeout_error(secs: u64, statements: usize) -> PluginError {
+    PluginError::internal(if statements > 1 {
+        format!(
+            "SurrealDB did not finish these {statements} statements within the plugin's query timeout ({secs}s), which bounds the whole run, not each statement. The plugin stopped waiting: statements that finished before it were applied, and the rest may still be running on the server. Raise or disable the timeout in the SurrealDB plugin settings, or run fewer statements at once."
+        )
+    } else {
+        format!(
+            "SurrealDB did not answer within the plugin's query timeout ({secs}s). The plugin stopped waiting, but the statement may still be running on the server. Raise or disable it in the SurrealDB plugin settings, or add a TIMEOUT clause to the statement."
+        )
+    })
 }
 
 /// Add hints (which need the signed-in level) to statement errors.
@@ -656,7 +664,10 @@ mod tests {
         // Other statements are not rewritten.
         let p = plan("UPDATE person SET a = 1", Some(10), 1, Some(30)).unwrap();
         assert_eq!(p.sql, "UPDATE person SET a = 1");
-        assert!(local_timeout_error(30).message.contains("30s"));
+        assert!(local_timeout_error(30, 1).message.contains("30s"));
+        let batch = local_timeout_error(30, 4).message;
+        assert!(batch.contains("4 statements"), "{batch}");
+        assert!(batch.contains("not each statement"), "{batch}");
     }
 
     #[test]

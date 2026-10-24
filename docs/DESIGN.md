@@ -254,7 +254,11 @@ or empty disables it):
   the live test the server answered after 1.0 s for `TIMEOUT 1s`.
 - Every query call is also bounded locally at the timeout plus one second.
   The error says that the plugin stopped waiting and that the statement may
-  still be running on the server.
+  still be running on the server. A script or editor batch is one `query`
+  call, so the bound covers the whole run, not each statement (the server
+  gives no per-statement progress to bound them separately); for several
+  statements the error says so, and that the ones that finished were
+  applied.
 
 Set it below the host's call timeout to get these messages instead of the
 host's generic one.
