@@ -10,8 +10,9 @@
 //! 2. When the host asks for distinct / min / max / top values: the first
 //!    [`SAMPLE_SIZE`] non-NULL values in the table's natural order go into
 //!    `$values`, and everything else is computed from that sample with
-//!    `array::distinct`, `array::min` / `array::max` and a
-//!    `GROUP BY … ORDER BY count DESC LIMIT n` over `$values`. When the
+//!    `array::distinct`, `array::min` / `array::max`, and the groups of
+//!    `GROUP BY v` over `$values`, sorted by count in an outer SELECT (2.x
+//!    ignores an ORDER BY in the grouping SELECT itself). When the
 //!    column has more non-NULL values than the sample, the result says so
 //!    with `sample_size`.
 //!
@@ -133,8 +134,11 @@ pub fn build_script(request: &StatsRequest, sample_size: u64) -> String {
     }
     script.push_str(&format!("\nRETURN {{ {} }};", fields.join(", ")));
     if request.top_values {
+        // The sort is in an outer SELECT: 2.x ignores `ORDER BY count` in the
+        // SELECT that groups and returns the groups ordered by `v`, so the
+        // LIMIT would keep the wrong values.
         script.push_str(&format!(
-            "\nSELECT v, count() AS count FROM $values GROUP BY v ORDER BY count DESC, v ASC LIMIT {};",
+            "\nSELECT * FROM (SELECT v, count() AS count FROM $values GROUP BY v) ORDER BY count DESC, v ASC LIMIT {};",
             request.top_values_limit
         ));
     }
@@ -338,7 +342,7 @@ mod tests {
             "SELECT count() AS rows, count((`n` = NONE) OR (`n` = NULL)) AS nulls FROM `item` WHERE (n > 2\n) GROUP ALL;\n\
              LET $values = (SELECT `n` AS v FROM `item` WHERE (n > 2\n) AND `n` != NONE AND `n` != NULL LIMIT 1000);\n\
              RETURN { sampled: array::len($values), distinct: array::len(array::distinct($values.v)), min: array::min($values.v), max: array::max($values.v) };\n\
-             SELECT v, count() AS count FROM $values GROUP BY v ORDER BY count DESC, v ASC LIMIT 10;"
+             SELECT * FROM (SELECT v, count() AS count FROM $values GROUP BY v) ORDER BY count DESC, v ASC LIMIT 10;"
         );
     }
 

@@ -354,8 +354,8 @@ LET $values = (SELECT `c` AS v FROM `t`
 RETURN { sampled: array::len($values),
          distinct: array::len(array::distinct($values.v)),
          min: array::min($values.v), max: array::max($values.v) };
-SELECT v, count() AS count FROM $values
-  GROUP BY v ORDER BY count DESC, v ASC LIMIT 10;
+SELECT * FROM (SELECT v, count() AS count FROM $values GROUP BY v)
+  ORDER BY count DESC, v ASC LIMIT 10;
 ```
 
 Only the parts the host asked for are added. Choices:
@@ -377,7 +377,10 @@ Only the parts the host asked for are added. Choices:
   ordering, so they work for numbers, datetimes, strings and durations
   alike (`math::min` only takes numbers). The host asks for them only for
   numeric and date/time columns.
-- **Top values.** `GROUP BY v` over the sample, ties broken by value. Values
+- **Top values.** `GROUP BY v` over the sample, sorted by count in an
+  outer SELECT, ties broken by value. The sort cannot go in the grouping
+  SELECT: 2.x ignores `ORDER BY count` there and returns the groups ordered
+  by `v`, and the `LIMIT` then keeps the wrong values. Values
   are converted like grid cells (record ids as `table:id`, datetimes as
   text).
 - **Filter.** The filter is inserted as `(<filter>\n)`: the newline keeps a

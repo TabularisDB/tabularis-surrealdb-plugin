@@ -966,7 +966,12 @@ fn column_statistics_respect_the_filter_and_the_requested_parts() {
     // Numbers and datetimes: min / max in the column's own ordering.
     let r = column_stats(&mut p, &conn, "stats_probe", "n", Value::Null, all.clone()).unwrap();
     assert_eq!((r["min"].clone(), r["max"].clone()), (json!(1.5), json!(9)));
-    assert_eq!(r["top_values"][0], json!({ "value": 5, "count": 2 }));
+    // Most frequent first, ties by value (2.x ignored this order once).
+    assert_eq!(
+        r["top_values"],
+        json!([{ "value": 5, "count": 2 }, { "value": 1.5, "count": 1 },
+               { "value": 9, "count": 1 }])
+    );
     let r = column_stats(&mut p, &conn, "stats_probe", "d", Value::Null, all.clone()).unwrap();
     assert!(
         r["min"]
