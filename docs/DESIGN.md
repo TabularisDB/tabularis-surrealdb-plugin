@@ -179,8 +179,15 @@ MySQL-style modes for this dialect; the plugin maps them as follows:
 
 A `wss://` (or `https://`) URL in Host always uses TLS, with Verify Identity
 unless the SSL mode says otherwise; a `ws://` URL with a TLS mode is an
-error. Trusted roots are the bundled Mozilla roots (`webpki-roots`) plus the
-PEM file in "CA certificate", so private and self-signed CAs work. Client
+error. Trusted roots are the PEM file in "CA certificate" when it is set,
+and only that file; otherwise the bundled Mozilla roots (`webpki-roots`).
+Trusting both would let anyone with a publicly valid certificate through:
+for any host name under Verify CA, which does not check the name, and for
+the server's own name under Verify Identity. The file replaces the public
+roots in both modes, as `sslrootcert` does for PostgreSQL's `verify-ca` and
+`verify-full` and `--ssl-ca` for MySQL's `VERIFY_CA` and `VERIFY_IDENTITY`:
+whoever sets a private CA has said which CA signs the server. Required
+checks no certificate and ignores the file. Client
 certificates are rejected with an explanation: SurrealDB authenticates with
 users and tokens. `tests/live_tls.rs` generates a private CA with `openssl`,
 starts `surreal start --web-crt/--web-key` on a free port and checks every

@@ -221,6 +221,23 @@ fn wss_with_private_ca_and_ssl_modes() {
     )
     .unwrap();
 
+    // The CA file is the only trust anchor: a CA that did not sign the
+    // server certificate is refused, even under Verify CA.
+    let other = server.dir.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    make_certificates(&other);
+    let (_, message) = test(
+        &mut p,
+        connection(
+            "127.0.0.1",
+            port,
+            Some("verify_ca"),
+            Some(&other.join("ca.pem")),
+        ),
+    )
+    .unwrap_err();
+    assert!(message.contains("TLS handshake"), "{message}");
+
     // Required encrypts without checking the certificate.
     test(
         &mut p,

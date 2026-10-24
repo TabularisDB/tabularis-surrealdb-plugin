@@ -76,8 +76,10 @@ example `wss://my-instance.aws-euw1.surreal.cloud`.
 | Verify CA | `wss://`, certificate must chain to a trusted CA |
 | Verify Identity | `wss://`, chain and host name checked (default for `wss://` URLs) |
 
-Trusted CAs are the usual public roots plus the file in "CA certificate"
-(PEM), for servers with a private or self-signed CA. Client certificates are
+Trusted CAs are the usual public roots, or, when "CA certificate" (PEM) is
+set, only the CAs in that file: for a server with a private or self-signed
+CA, a certificate from any other CA is refused (as with PostgreSQL's
+`sslrootcert`). Required checks no certificate, so it ignores the file. Client certificates are
 not used by SurrealDB and are rejected.
 
 The namespace and database must exist. The plugin checks this before

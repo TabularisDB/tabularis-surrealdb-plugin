@@ -1,8 +1,10 @@
 //! rustls client configuration for `wss://` connections.
 //!
-//! Trusted roots are the bundled Mozilla roots (`webpki-roots`) plus the
-//! connection's CA file. The SSL mode picks how much of the server
-//! certificate is checked; see [`TlsVerify`].
+//! Trusted roots are the connection's CA file when one is set, and the
+//! bundled Mozilla roots (`webpki-roots`) otherwise, never both: like
+//! PostgreSQL's `sslrootcert` and MySQL's `--ssl-ca`, the CA file is the only
+//! trust anchor. The SSL mode picks how much of the server certificate is
+//! checked; see [`TlsVerify`].
 
 use std::sync::Arc;
 
@@ -43,25 +45,31 @@ pub fn client_config(settings: &TlsSettings) -> Result<ClientConfig, String> {
     Ok(config)
 }
 
+/// The CA file's certificates alone, or the Mozilla roots without one.
+///
+/// Trusting the public roots next to a private CA would let anyone with a
+/// publicly valid certificate pass: for any name under Verify CA (which does
+/// not check the name), and for the server's own name under Verify Identity.
 fn root_store(ca_file: Option<&str>) -> Result<RootCertStore, String> {
-    let mut roots = RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    let Some(path) = ca_file else {
+        return Ok(RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        });
     };
-    if let Some(path) = ca_file {
-        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(path)
-            .map_err(|e| format!("Could not read the CA certificate file {path}: {e}"))?
-            .collect::<Result<_, _>>()
-            .map_err(|e| format!("Could not parse the CA certificate file {path}: {e}"))?;
-        if certs.is_empty() {
-            return Err(format!(
-                "The CA certificate file {path} contains no PEM certificate."
-            ));
-        }
-        for cert in certs {
-            roots
-                .add(cert)
-                .map_err(|e| format!("Invalid CA certificate in {path}: {e}"))?;
-        }
+    let mut roots = RootCertStore::empty();
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(path)
+        .map_err(|e| format!("Could not read the CA certificate file {path}: {e}"))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("Could not parse the CA certificate file {path}: {e}"))?;
+    if certs.is_empty() {
+        return Err(format!(
+            "The CA certificate file {path} contains no PEM certificate."
+        ));
+    }
+    for cert in certs {
+        roots
+            .add(cert)
+            .map_err(|e| format!("Invalid CA certificate in {path}: {e}"))?;
     }
     Ok(roots)
 }
@@ -208,6 +216,37 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("contains no PEM certificate"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A self-signed P-256 CA, valid until 2126, used only to fill a CA file.
+    const TEST_CA: &str = "\
+-----BEGIN CERTIFICATE-----\n\
+MIIBnDCCAUKgAwIBAgIUKRHsH3oOhvXAaR0X39FDJuniQZIwCgYIKoZIzj0EAwIw\n\
+KzEpMCcGA1UEAwwgVGFidWxhcmlzIFN1cnJlYWxEQiB1bml0IHRlc3QgQ0EwIBcN\n\
+MjYxMDI0MDU0MjI5WhgPMjEyNjA5MzAwNTQyMjlaMCsxKTAnBgNVBAMMIFRhYnVs\n\
+YXJpcyBTdXJyZWFsREIgdW5pdCB0ZXN0IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0D\n\
+AQcDQgAEIKycUAh0YYGosDqQYxq5iwac7TMZjHR0vYMWEQGY3N4BF8+qgx3zqscn\n\
+I94ATzZsTQyNBLPhnUFWLFrMF9IXE6NCMEAwHQYDVR0OBBYEFEmNY4pvEgolm+5a\n\
+EAPmzDjW+1w1MA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgIEMAoGCCqG\n\
+SM49BAMCA0gAMEUCIQCSDuPYmXvH3MC3eHyKrXSOnSdjHec/pTGHx/Q+BS2dOwIg\n\
+Pt20CXXgdr8xgxSQXMA/VEma166Gr0V4CbACqJizTSQ=\n\
+-----END CERTIFICATE-----\n\
+";
+
+    #[test]
+    fn a_ca_file_replaces_the_public_roots() {
+        assert_eq!(
+            root_store(None).unwrap().len(),
+            webpki_roots::TLS_SERVER_ROOTS.len()
+        );
+        let dir =
+            std::env::temp_dir().join(format!("surrealdb-plugin-tls-roots-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ca.pem");
+        std::fs::write(&path, TEST_CA).unwrap();
+        let roots = root_store(Some(&path.to_string_lossy())).unwrap();
+        assert_eq!(roots.len(), 1, "only the CA file is trusted");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

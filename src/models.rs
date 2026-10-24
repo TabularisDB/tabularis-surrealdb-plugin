@@ -144,8 +144,8 @@ pub enum TlsVerify {
     None,
 }
 
-/// TLS options for one connection. Trusted roots are the bundled Mozilla
-/// roots plus the PEM file in `ca_file`, if set.
+/// TLS options for one connection. Trusted roots are the PEM file in
+/// `ca_file` when set (and nothing else), or the bundled Mozilla roots.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct TlsSettings {
     pub verify: TlsVerify,
