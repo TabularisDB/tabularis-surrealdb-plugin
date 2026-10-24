@@ -168,6 +168,11 @@ Values in the grid:
 - A transaction cannot span separate runs; keep `BEGIN … COMMIT` in one run.
 - The grid's filter bar may generate SQL operators SurrealQL does not have
   (for example `LIKE`); type the filter as SurrealQL instead.
+- Filtering by a value from the column statistics popover or a grid cell
+  quotes it as text, which SurrealQL never equals a record link, datetime,
+  duration or UUID (nor, from the popover, a boolean). Type those filters with a typed literal, for
+  example `author = person:1` or `d = d'2024-01-02T00:00:00Z'`. See
+  [Column statistics](docs/DESIGN.md#column-statistics).
 - The connection form has no field to pin the sign-in level; `auto` is used.
 
 ## Installation

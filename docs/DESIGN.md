@@ -382,6 +382,20 @@ Only the parts the host asked for are added. Choices:
   by `v`, and the `LIMIT` then keeps the wrong values. Values
   are converted like grid cells (record ids as `table:id`, datetimes as
   text).
+- **Filtering by a top value.** Clicking a value filters by
+  `column = value`. The host turns every top value into text
+  (`parseDistinctValues`) and quotes it unless the column is numeric
+  (`formatSqlValueForFilter`), so the filter compares the column with a
+  string. SurrealQL compares strictly (`person:1 = 'person:1'`,
+  `d'2024-01-02T00:00:00Z' = '2024-01-02T00:00:00Z'` and `true = 'true'`
+  are all false on 2.x and 3.x), so for record links, datetimes, durations,
+  UUIDs and booleans that filter matches nothing. Strings and numbers work.
+  The grid's "filter by cell value" builds the same clause from the cell,
+  whose record links, datetimes, durations and UUIDs are already text, so it
+  has the same gap except for booleans. No value the plugin returns can avoid the quoting; fixing it needs
+  either the host to take a ready-made literal from the plugin, or the
+  plugin to cast string literals compared with typed columns in the grid
+  query. Until then it is listed under Limitations in the README.
 - **Filter.** The filter is inserted as `(<filter>\n)`: the newline keeps a
   trailing `--` comment from swallowing the bracket. It must have the shape
   of one condition (brackets, quotes and regex literals balance, no
