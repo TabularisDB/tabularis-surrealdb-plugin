@@ -578,6 +578,11 @@ Audit findings, fixed in M3:
   C code in the build is `ring`, which calls none of the functions that
   glibc 2.38 redirects to `__isoc23_*`, so the Rust standard library's 2.34
   is the expected floor. `linux-arm64` is built in `cross`'s older image.
+- The workflow only ran on a pushed tag, so a leg could first fail on the
+  release itself (`darwin-x64`, cross-built and smoke-tested under
+  Rosetta 2, had never run). A `workflow_dispatch` trigger now runs the
+  build legs by hand, with every smoke test and the glibc check, and skips
+  the tag check and the release job. See RELEASING.md.
 
 Archive layout. Each archive holds `surrealdb-plugin` (`.exe` on Windows)
 and `.tabularium` at the top level. That is what the installer expects

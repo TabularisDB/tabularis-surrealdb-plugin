@@ -31,6 +31,18 @@ publishing. Background on the platforms and the archive layout is in
 
 Land these changes through a PR, for example `chore(release): 0.1.0`.
 
+Then dry-run the release workflow on `main`. Started by hand, it builds,
+packs and smoke-tests every platform (including `darwin-x64` under
+Rosetta 2) and checks the glibc floor, but skips the release job and
+publishes nothing:
+
+```bash
+gh workflow run release.yml -R TabularisDB/tabularis-surrealdb-plugin --ref main
+gh run watch -R TabularisDB/tabularis-surrealdb-plugin
+```
+
+The archives stay attached to the run for a day, for a manual install.
+
 ## 2. Tag
 
 ```bash

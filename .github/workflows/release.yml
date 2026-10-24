@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - "v*"
+  # A dry run from the Actions tab (or `gh workflow run release.yml`):
+  # builds, packs and smoke-tests every platform, and publishes nothing.
+  # Use it before tagging, e.g. for the darwin-x64 leg under Rosetta.
+  workflow_dispatch:
 
 jobs:
   validate:
@@ -13,6 +17,8 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Check tag matches manifest version
+        # A dry run has no tag to check.
+        if: github.event_name == 'push'
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           TABULARIUM_VERSION=$(jq -r .version .tabularium)
@@ -164,6 +170,8 @@ jobs:
   release:
     name: Publish GitHub release
     needs: build
+    # Only for a pushed tag; a dry run stops after the builds.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
