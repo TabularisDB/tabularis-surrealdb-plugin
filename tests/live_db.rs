@@ -1017,6 +1017,17 @@ fn column_statistics_respect_the_filter_and_the_requested_parts() {
     );
     assert_eq!(r["top_values"].as_array().unwrap().len(), 5);
     assert!(r.get("sample_size").is_none());
+    // A regex literal with a quote in it is one condition.
+    let r = column_stats(
+        &mut p,
+        &conn,
+        "stats_probe",
+        "n",
+        json!("k = /a'?/"),
+        json!({}),
+    )
+    .unwrap();
+    assert_eq!(r["row_count"], 2, "{r}");
     let r = column_stats(&mut p, &conn, "item", "n", json!("n > 1000"), all.clone()).unwrap();
     assert_eq!(
         r,

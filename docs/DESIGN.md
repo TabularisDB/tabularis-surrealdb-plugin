@@ -383,9 +383,15 @@ Only the parts the host asked for are added. Choices:
   are converted like grid cells (record ids as `table:id`, datetimes as
   text).
 - **Filter.** The filter is inserted as `(<filter>\n)`: the newline keeps a
-  trailing `--` comment from swallowing the bracket. A filter with
-  unbalanced brackets or quotes, or a second statement, is refused with
-  `-32602` instead of being spliced into the script.
+  trailing `--` comment from swallowing the bracket. It must have the shape
+  of one condition (brackets, quotes and regex literals balance, no
+  top-level `;`), or it is refused with `-32602`: spliced in as is, it
+  would change the shape of the script around it and fail with a confusing
+  parse error, or report statistics for something else. This is a shape
+  check, not a security guard. One expression can still write
+  (`(DELETE t) = []`, `{ DELETE t; true }`), just as the same filter can in
+  the grid, which runs it as typed, and the editor runs anything; all of it
+  runs with the signed-in user's permissions.
 - **Empty results.** 2.x returns no row for a `GROUP ALL` over nothing, 3.x
   a zero row; both read as 0.
 - **Timeout.** With the query timeout setting on, every SELECT of the

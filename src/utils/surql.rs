@@ -9,6 +9,10 @@
 //!   `LIMIT … START …` can be appended for pagination),
 //! - the first keyword of a statement (SELECT, USE, …).
 //!
+//! It knows strings, comments, escaped identifiers (`` `…` ``, `⟨…⟩`) and
+//! regex literals (`/…/`), so a `;`, bracket or quote inside them is not
+//! taken for code.
+//!
 //! Anything it does not recognise is treated as opaque code, which keeps the
 //! callers on the safe path (no pagination push-down, no rewriting).
 
@@ -309,9 +313,14 @@ fn ends_with_ignore_case(s: &str, suffix: &str) -> bool {
 
 /// True when brackets in `sql` (outside strings and comments) balance and
 /// never close below zero.
-/// True when `sql` is one balanced expression with no second statement, so
-/// it can be embedded in another statement as `WHERE (<sql>\n)` without
-/// changing that statement's shape (used for the host's table filter).
+/// True when `sql` has the shape of one expression: brackets, quotes and
+/// regex literals balance, and there is no top-level `;`. It can then be
+/// embedded as `WHERE (<sql>\n)` without changing the shape of the
+/// statement around it (used for the host's table filter).
+///
+/// A shape check, not a security guard: one expression can still write
+/// (`(DELETE t) = []`, `{ DELETE t; true }`), as the same filter can in the
+/// grid, which runs it as typed.
 pub fn is_single_expression(sql: &str) -> bool {
     is_balanced(sql) && split_statements(sql).len() <= 1
 }
@@ -333,6 +342,12 @@ enum Event {
     Code,
 }
 
+/// Keywords after which an expression starts, so a `/` there opens a regex
+/// literal.
+const KEYWORDS_BEFORE_EXPRESSION: &[&str] = &[
+    "AND", "OR", "NOT", "IS", "WHERE", "RETURN", "IF", "THEN", "ELSE", "VALUE",
+];
+
 /// Character-level scanner shared by the helpers above.
 pub(crate) struct Scanner<'a> {
     src: &'a str,
@@ -346,6 +361,9 @@ pub(crate) struct Scanner<'a> {
     prev_significant: Option<char>,
     /// `prev_significant` as it was just before the most recent word.
     prev_word_context: Option<char>,
+    /// The most recent word, to tell a regex literal after a keyword
+    /// (`WHERE /x/ …`) from a division after an operand (`n / 2`).
+    last_word: Range<usize>,
 }
 
 impl<'a> Scanner<'a> {
@@ -358,6 +376,7 @@ impl<'a> Scanner<'a> {
             unterminated: false,
             prev_significant: None,
             prev_word_context: None,
+            last_word: 0..0,
         }
     }
 
@@ -397,6 +416,12 @@ impl<'a> Scanner<'a> {
                     self.mark_significant('⟩');
                     return Some(Event::Code);
                 }
+                '/' if self.regex_can_start() => {
+                    self.skip_regex();
+                    // An operand: a `/` right after it is a division.
+                    self.mark_significant('/');
+                    return Some(Event::Code);
+                }
                 ';' if self.depth == 0 => {
                     self.pos += 1;
                     self.prev_significant = None;
@@ -427,6 +452,7 @@ impl<'a> Scanner<'a> {
                         }
                     }
                     self.prev_word_context = self.prev_significant;
+                    self.last_word = start..self.pos;
                     self.mark_significant('a');
                     return Some(Event::Word(start..self.pos));
                 }
@@ -437,6 +463,44 @@ impl<'a> Scanner<'a> {
                 }
             }
         }
+    }
+
+    /// True when a `/` here starts a regex literal rather than a division:
+    /// where an operand is expected, i.e. at the start, after an operator,
+    /// an opening bracket or a separator, or after a keyword that takes an
+    /// expression. After an operand (a word, number, string or closing
+    /// bracket) it divides.
+    fn regex_can_start(&self) -> bool {
+        match self.prev_significant {
+            None => true,
+            Some('a') => {
+                let word = &self.src[self.last_word.clone()];
+                KEYWORDS_BEFORE_EXPRESSION
+                    .iter()
+                    .any(|k| word.eq_ignore_ascii_case(k))
+            }
+            Some(c) => "=!<>~([{,;:?|&+-*%^@".contains(c),
+        }
+    }
+
+    /// Skip a regex literal `/…/` (with `\/` escapes). A regex is one line;
+    /// one without its closing `/` there marks the source unterminated.
+    fn skip_regex(&mut self) {
+        self.pos += 1;
+        while let Some(c) = self.peek() {
+            if c == '\n' {
+                break;
+            }
+            self.pos += c.len_utf8();
+            if c == '\\' {
+                if let Some(next) = self.peek().filter(|n| *n != '\n') {
+                    self.pos += next.len_utf8();
+                }
+            } else if c == '/' {
+                return;
+            }
+        }
+        self.unterminated = true;
     }
 
     fn mark_significant(&mut self, c: char) {
@@ -666,5 +730,35 @@ mod tests {
         assert!(!is_single_expression("1) OR (1"));
         assert!(!is_single_expression("s = 'open"));
         assert!(!is_single_expression("n > 1 /* unterminated"));
+        // A shape check only: one expression may still write.
+        assert!(is_single_expression("(DELETE item) = []"));
+    }
+
+    #[test]
+    fn regex_literals_are_opaque() {
+        // A quote or `;` inside a regex is not code.
+        assert!(is_single_expression("name = /it's/"));
+        assert!(is_single_expression("string::matches(name, /a;b\\/c/)"));
+        assert!(is_single_expression("WHERE /it's/ = name"));
+        assert_eq!(
+            texts("SELECT * FROM t WHERE s = /x;y/; RETURN 1"),
+            vec!["SELECT * FROM t WHERE s = /x;y/", "RETURN 1"]
+        );
+        // A regex cannot hide a second statement from the check.
+        assert!(!is_single_expression(
+            "x = /'/) ; DELETE item ; SELECT * FROM item WHERE (x = /'/"
+        ));
+        assert!(!is_single_expression("x = /unterminated"));
+        // After an operand, `/` divides.
+        assert_eq!(
+            texts("RETURN (10) / 2 / 5; RETURN n / 2; RETURN 'a' / 1"),
+            vec!["RETURN (10) / 2 / 5", "RETURN n / 2", "RETURN 'a' / 1"]
+        );
+        assert!(is_single_expression("count / 2 > 1 AND n / 3 = 1"));
+        // Comments still win.
+        assert_eq!(
+            texts("RETURN 1 // it's; a comment"),
+            vec!["RETURN 1 // it's; a comment"]
+        );
     }
 }

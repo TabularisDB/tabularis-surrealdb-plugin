@@ -76,7 +76,7 @@ impl StatsRequest {
         if let Some(f) = &filter {
             if !is_single_expression(f) {
                 return Err(PluginError::invalid_params(
-                    "The table filter must be a single SurrealQL condition (balanced brackets and quotes, no `;`).",
+                    "The table filter must be a single SurrealQL condition, with balanced brackets and quotes, to be added to the statistics query.",
                 ));
             }
         }
@@ -346,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_names_and_filters_that_break_out() {
+    fn rejects_missing_names_and_filters_of_the_wrong_shape() {
         for request in [
             json!({ "column": "c" }),
             json!({ "table": "t" }),
@@ -362,6 +362,9 @@ mod tests {
             .unwrap_err();
             assert!(e.message.contains("single SurrealQL condition"), "{filter}");
         }
+        let regex =
+            json!({ "request": { "table": "t", "column": "c", "filter": "name = /it's/" } });
+        assert!(StatsRequest::from_params(&regex).is_ok());
     }
 
     #[test]
