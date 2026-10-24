@@ -3,6 +3,7 @@
 pub mod metadata;
 pub mod query;
 pub mod results;
+pub mod stats;
 pub mod templates;
 
 use serde_json::Value;

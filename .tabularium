@@ -30,6 +30,7 @@
     "identifier_quote": "`",
     "sql_dialect": "mysql",
     "table_query_templates": true,
+    "column_stats": true,
     "alter_primary_key": false,
     "alter_column": false,
     "create_foreign_keys": false,
