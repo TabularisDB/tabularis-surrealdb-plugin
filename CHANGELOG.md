@@ -22,8 +22,9 @@ native SurrealQL. Requires Tabularis 0.26.0 or later; column statistics need
   URL tried), a failed sign-in (listing each level tried), missing
   permissions, and a namespace or database that does not exist. The plugin
   never creates a missing namespace or database.
-- TLS from the connection's SSL tab: Required, Verify CA and Verify
-  Identity, with a CA certificate file for private or self-signed CAs.
+- TLS from the connection's SSL tab: Required (also an empty mode, as the
+  tab shows it), Verify CA and Verify Identity. A CA certificate file for a
+  private or self-signed CA becomes the only trusted CA.
 - Connection string import:
   `surrealdb://user:pass@host:8000/namespace/database`.
 - Explorer: namespaces and databases, tables (SCHEMAFULL, SCHEMALESS,
@@ -34,9 +35,9 @@ native SurrealQL. Requires Tabularis 0.26.0 or later; column statistics need
 - Native SurrealQL in the editor and notebooks, including graph
   traversals. "Run all" sends the script as one query, so `LET` variables
   and transactions work across statements, and each statement gets its own
-  result tab or error. Statements that return nothing (`LET`, `DEFINE`,
-  `BEGIN`, …) get no result tab, so a notebook cell shows the first real
-  result.
+  result tab or error, on 2.x as on 3.x. Statements that never return data
+  (`USE`, `LET`, `DEFINE`, `BEGIN`, …) get no result tab, so a notebook
+  cell shows the first real result.
 - Writes show the records they returned as affected rows, and results show
   the server's execution time.
 - Values: record ids as `table:id` text you can paste back into a query,
@@ -51,9 +52,9 @@ native SurrealQL. Requires Tabularis 0.26.0 or later; column statistics need
   counts, min / max and top values, computed in SurrealQL with the tab's
   filter. Value statistics on columns with more than 100 000 values come
   from a sample. Needs Tabularis 0.29.0.
-- Plugin setting "Query timeout (seconds)": table-grid SELECTs get a
-  SurrealQL `TIMEOUT`, and any query stops waiting after that long with a
-  message that says so.
+- Plugin setting "Query timeout (seconds)": table-grid and column
+  statistics SELECTs get a SurrealQL `TIMEOUT`, and any query stops waiting
+  after that long with a message that says so.
 - Read-only grid: grid edits and schema changes are disabled. SurrealQL
   typed in the editor runs with your user's own permissions, so it can
   still write.
