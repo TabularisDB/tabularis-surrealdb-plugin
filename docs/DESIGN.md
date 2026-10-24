@@ -572,7 +572,9 @@ Audit findings, fixed in M3:
 - Tabularis builds its Linux packages against glibc 2.35 (an `ubuntu:22.04`
   container in its `build.yml`), while `linux-x64` is built on
   `ubuntu-latest` (glibc 2.39). A new step reads the glibc symbol versions
-  the binary needs with `readelf` and fails the build above 2.35. The only
+  the binary needs with `readelf` and fails the build above 2.35. It runs
+  with `pipefail` and fails when it finds no glibc version at all, since a
+  `-linux-gnu` binary always has one: a `readelf` error cannot pass. The only
   C code in the build is `ring`, which calls none of the functions that
   glibc 2.38 redirects to `__isoc23_*`, so the Rust standard library's 2.34
   is the expected floor. `linux-arm64` is built in `cross`'s older image.

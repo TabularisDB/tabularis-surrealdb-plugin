@@ -122,15 +122,22 @@ jobs:
       # Tabularis builds its own Linux packages against glibc 2.35 (Ubuntu
       # 22.04) so they run on older LTS distros. The plugin is built on
       # ubuntu-latest, so check that it needs no newer glibc than the host
-      # does. readelf reads both x86_64 and aarch64 binaries.
+      # does. readelf reads both x86_64 and aarch64 binaries. A -linux-gnu
+      # binary always links glibc, so finding no version is an error (for
+      # example readelf failing), never a pass.
       - name: Check glibc requirement (linux)
-        if: runner.os == 'Linux'
+        if: endsWith(matrix.target, '-linux-gnu')
         run: |
+          set -o pipefail
           max=2.35
           needed=$(readelf -W --version-info staging/surrealdb-plugin \
-            | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -n 1)
-          echo "surrealdb-plugin needs glibc ${needed:-(none)}; Tabularis needs $max"
-          if [ -n "$needed" ] && [ "$(printf '%s\n%s\n' "$needed" "$max" | sort -V | tail -n 1)" != "$max" ]; then
+            | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -n 1) || needed=""
+          if [ -z "$needed" ]; then
+            echo "::error::Could not read a glibc version from surrealdb-plugin: readelf failed or listed none, and a ${{ matrix.target }} binary always needs one"
+            exit 1
+          fi
+          echo "surrealdb-plugin needs glibc $needed; Tabularis needs $max"
+          if [ "$(printf '%s\n%s\n' "$needed" "$max" | sort -V | tail -n 1)" != "$max" ]; then
             echo "::error::surrealdb-plugin needs glibc $needed, newer than the $max Tabularis targets on Linux"
             exit 1
           fi
