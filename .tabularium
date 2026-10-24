@@ -13,6 +13,7 @@
   "support": {
     "issues_url": "https://github.com/TabularisDB/tabularis-surrealdb-plugin/issues"
   },
+  "min_runtime_version": "0.26.0",
   "color": "#ff00a0",
   "default_port": 8000,
   "default_username": "root",

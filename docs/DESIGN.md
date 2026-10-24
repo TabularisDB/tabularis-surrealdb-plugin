@@ -6,9 +6,10 @@ evidence for them, and the documentation they rely on. Scope:
 
 ## Coverage of #1019 and the plugin protocol
 
-Status: **M1** = milestone 1 (PR #1), **M2** = this milestone, **deferred**
-= not implemented, with the reason. Evidence names a live test in
-`tests/live_db.rs` / `tests/live_tls.rs`, or a unit test module.
+Status: **M1** = milestone 1 (PR #1), **M2** = milestone 2 (PR #2, with
+column statistics in PR #3), **M3** = release readiness, **deferred** = not
+implemented, with the reason. Evidence names a live test in
+`tests/live_db.rs` / `tests/live_tls.rs`, a unit test module, or a CI job.
 
 ### Acceptance criteria
 
@@ -22,7 +23,7 @@ Status: **M1** = milestone 1 (PR #1), **M2** = this milestone, **deferred**
 | Timeouts and query errors handled cleanly; cancellation semantics documented | M1 (cancel, docs); M2 (query timeout setting, per-statement errors) | `cancel_stops_waiting_and_keeps_the_plugin_responsive`, `query_timeout_is_enforced_with_actionable_errors` |
 | Unsupported grid writes, DDL and other capabilities disabled or answered with the documented response | M1 | `rpc` tests `writes_and_ddl_return_the_documented_unsupported_response`, `unknown_methods_are_method_not_found` |
 | Metadata and value-conversion tests; reproducible fixture with schemafull/schemaless records, nested values, record ids, relations, permission errors | M1; M2 adds record links and a write table | `utils::values`, `utils::define`, `handlers::metadata` tests; `fixture/seed.surql` |
-| Valid `.tabularium`, installation instructions, release assets for the declared platforms | Partly: manifest validated in CI, release workflow in place. **Deferred to M3**: first tagged release, install docs for released assets, registry submission | CI `Validate .tabularium manifest` |
+| Valid `.tabularium`, installation instructions, release assets for the declared platforms | M3: manifest with `min_runtime_version`, release workflow audited for the five registry platforms, README install from the registry and from release archives, `CHANGELOG.md` 0.1.0, `docs/RELEASING.md`. **Left to maintainers**: tag `v0.1.0`, check the published release, submit to the registry; see Release and distribution | CI `Validate .tabularium manifest`; release steps dry-run for darwin-arm64 |
 
 ### Protocol methods and capabilities
 
@@ -45,7 +46,7 @@ Status: **M1** = milestone 1 (PR #1), **M2** = this milestone, **deferred**
 | Views (`views`), materialized views | Deferred / not applicable. Table views (`DEFINE TABLE … AS SELECT`) are listed as tables with a "table view" comment | — |
 | Routines (`routines`, `routine_management`) | Deferred: `DEFINE FUNCTION` could map, not in scope | — |
 | Triggers (`triggers`) | Deferred: `DEFINE EVENT` could map, not in scope | — |
-| `insert_record`, `update_record`, `delete_record` | Unsupported (`readonly: true`), `-32601`. Candidate for M3 (record id as key) | `rpc` tests |
+| `insert_record`, `update_record`, `delete_record` | Unsupported (`readonly: true`), `-32601`. Candidate for a later milestone (record id as key) | `rpc` tests |
 | DDL methods, `drop_index`, `drop_foreign_key`, view DDL | Unsupported (`manage_tables: false`), `-32601` | `rpc` tests |
 | `save_blob_to_file`, `fetch_blob_as_data_url` | `-32601`; bytes are shown as `0x…` hex | — |
 | `get_connection_metadata` (`connection_metadata`) | Not needed: one static manifest fits every server | — |
@@ -236,8 +237,9 @@ this with `RETURN sleep(2s)`.
 **This is local cancellation only.** The statement keeps running on the
 SurrealDB server and its effects, if any, still apply. SurrealDB 2.x and
 3.0–3.2 have no RPC to cancel a running query; the RPC reference lists
-`query_cancel` from 3.3.0. It is deferred to M3: the local test server is
-3.2.3, and the plugin does not ship server-side cancellation it cannot test.
+`query_cancel` from 3.3.0. It is deferred to a later milestone: the local
+test server is 3.2.3, and the plugin does not ship server-side cancellation
+it cannot test.
 
 Connecting is bounded at 10 s, and sign-in, the namespace/database check
 and `use` at 15 s each, so an unreachable or unresponsive server fails fast
@@ -539,11 +541,90 @@ response: code `-32601` and a message that starts with
 `get_schema_snapshot` and `get_ai_schema_context` get the same code so the
 host uses its fallbacks.
 
+## Release and distribution
+
+Platforms (M3). `release.yml` builds one archive per registry platform key,
+and the archive name carries the key, which is how the registry assigns an
+asset to a platform (`inferPlatformKey` in Tabularium's
+`apps/api/src/lib/webhook.ts`). Tabularis then downloads the asset whose key
+matches `get_current_platform()` (`src-tauri/src/plugins/registry.rs`).
+
+| Key | Target | Runner | Archive |
+|---|---|---|---|
+| `linux-x64` | `x86_64-unknown-linux-gnu` | `ubuntu-latest` | `surrealdb-plugin-linux-x64.zip` |
+| `linux-arm64` | `aarch64-unknown-linux-gnu` | `ubuntu-latest`, `cross` | `surrealdb-plugin-linux-arm64.zip` |
+| `darwin-x64` | `x86_64-apple-darwin` | `macos-latest` | `surrealdb-plugin-darwin-x64.zip` |
+| `darwin-arm64` | `aarch64-apple-darwin` | `macos-latest` | `surrealdb-plugin-darwin-arm64.zip` |
+| `win-x64` | `x86_64-pc-windows-msvc` | `windows-latest` | `surrealdb-plugin-win-x64.zip` |
+
+The manifest has no platform list; the registry derives the platforms from
+the release assets. There is no `win-arm64` build.
+
+Audit findings, fixed in M3:
+
+- `darwin-arm64` ran on `macos-14`, which GitHub fails during brownouts in
+  October 2026 and retires on 2026-11-02 (actions/runner-images#13518). A
+  failed build job blocks the release job, so no release would be
+  published. Both macOS legs now use `macos-latest` (Apple Silicon); the
+  `darwin-x64` smoke test runs under Rosetta 2, which those images include.
+  The `create-plugin` template this workflow came from still uses
+  `macos-14`.
+- Tabularis builds its Linux packages against glibc 2.35 (an `ubuntu:22.04`
+  container in its `build.yml`), while `linux-x64` is built on
+  `ubuntu-latest` (glibc 2.39). A new step reads the glibc symbol versions
+  the binary needs with `readelf` and fails the build above 2.35. It runs
+  with `pipefail` and fails when it finds no glibc version at all, since a
+  `-linux-gnu` binary always has one: a `readelf` error cannot pass. The only
+  C code in the build is `ring`, which calls none of the functions that
+  glibc 2.38 redirects to `__isoc23_*`, so the Rust standard library's 2.34
+  is the expected floor. `linux-arm64` is built in `cross`'s older image.
+- The workflow only ran on a pushed tag, so a leg could first fail on the
+  release itself (`darwin-x64`, cross-built and smoke-tested under
+  Rosetta 2, had never run). A `workflow_dispatch` trigger now runs the
+  build legs by hand, with every smoke test and the glibc check, and skips
+  the tag check and the release job. See RELEASING.md.
+
+Archive layout. Each archive holds `surrealdb-plugin` (`.exe` on Windows)
+and `.tabularium` at the top level. That is what the installer expects
+(`src-tauri/src/plugins/installer.rs`, `package_kind.rs`): it reads
+`.tabularium` by that exact name, requires `kind` absent or `driver`,
+compares the manifest `id` and `version` with the registry's, extracts into
+`plugins/drivers/surrealdb/`, and applies the Unix mode stored in the zip,
+so the executable bit set by `zip` survives. Checked locally for
+`darwin-arm64` by running the package and smoke-test steps of
+`release.yml`: two entries, `surrealdb-plugin` with mode `0755`, and the
+binary answers `initialize`.
+
+The release job also uploads `.tabularium` on its own (GitHub renames it to
+`default.tabularium`; the registry accepts both), since the registry reads
+the manifest from the release assets. The tag minus `v` must equal the
+manifest `version`; the `validate` job checks this before anything is
+built. The release body is this version's section of `CHANGELOG.md`.
+
+`min_runtime_version` is `0.26.0`, the first Tabularis release with
+driver-owned query templates (`table_query_templates`, used for Generate
+SQL) and the configurable plugin call timeout the README refers to.
+Tabularis 0.23.0 and later refuse a plugin whose floor they do not meet,
+and the registry hides the release from them. Column statistics need
+0.29.0 but are optional: older hosts ignore `column_stats`. The plugin was
+developed and tested against Tabularis nightlies after 0.28.0.
+
+What maintainers still do, in order (details in
+[RELEASING.md](RELEASING.md)): merge the stack, set the release date in
+`CHANGELOG.md`, push the tag `v0.1.0`, check the five archives and
+`default.tabularium` on the release, and submit the repository at
+<https://registry.tabularis.dev/submit>.
+
 ## Open questions
 
 - Auth level in the connection form: pinning it needs a
   `connection-modal.extra_fields` UI extension, i.e. a `ui/` bundle that
   `release.yml` does not build yet. Until then `auto` is used.
+- Icon: the manifest has a brand colour but no `icon`, pending a decision on
+  using SurrealDB's logo, so the registry card shows none.
+- Runtime floor: `0.26.0` follows from the features above. `0.29.0` would
+  match the hosts the plugin was tested on and include column statistics,
+  at the cost of excluding 0.26–0.28.
 
 ## Where the docs disagree
 
@@ -563,7 +644,7 @@ host uses its fallbacks.
 
 ## References
 
-Read on 2026-10-16 (M1 and M2).
+Read on 2026-10-16 (M1 and M2), and on 2026-10-23 for M3.
 
 Tabularis:
 
@@ -586,6 +667,18 @@ Tabularis:
   `src/hooks/useReferencedRecord.ts` and `src/utils/foreignKeys.ts`
   (foreign-key lookup SQL), `src/components/modals/NewConnectionModal.tsx`
   (SSL modes), `packages/explain/src/types.ts` (parsed plan shape)
+- For M3, TabularisDB/tabularis at `63240581`:
+  `plugins/PLUGIN_GUIDE.md` (Publishing), `plugins/README.md` (platform
+  keys, install directory), `src-tauri/src/plugins/{installer,package_kind,registry,tabularium,runtime_version}.rs`,
+  `.github/workflows/build.yml` (glibc 2.35 container) and
+  `packages/create-plugin/templates/rust-driver/.github/workflows/release.yml.tmpl`;
+  the wiki pages
+  [Publishing Plugins](https://tabularis.dev/wiki/plugin-development) and
+  [Installing Plugins](https://tabularis.dev/wiki/installing-plugins);
+  TabularisDB/tabularium `apps/api/src/lib/webhook.ts` (asset name to
+  platform key); the release workflows and published assets of
+  tabularis-trino-plugin 0.1.6 and tabularis-sqlserver-plugin 1.0.0-beta.3;
+  actions/runner-images#13518 (macOS 14 retirement)
 - Sibling plugins used for conventions: tabularis-trino-plugin 0.1.6,
   tabularis-libsql-plugin 1.0.1, tabularis-elasticsearch-plugin,
   tabularis-mongodb-plugin

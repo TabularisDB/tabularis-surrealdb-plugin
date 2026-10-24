@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - "v*"
+  # A dry run from the Actions tab (or `gh workflow run release.yml`):
+  # builds, packs and smoke-tests every platform, and publishes nothing.
+  # Use it before tagging, e.g. for the darwin-x64 leg under Rosetta.
+  workflow_dispatch:
 
 jobs:
   validate:
@@ -13,6 +17,8 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Check tag matches manifest version
+        # A dry run has no tag to check.
+        if: github.event_name == 'push'
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           TABULARIUM_VERSION=$(jq -r .version .tabularium)
@@ -29,6 +35,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # platform-label is the registry platform key. The registry maps each
+        # release asset to a platform by its file name
+        # (surrealdb-plugin-<platform-label>.zip), and Tabularis picks the
+        # asset whose key matches the machine it runs on.
         include:
           - platform-label: linux-x64
             runner: ubuntu-latest
@@ -41,13 +51,18 @@ jobs:
             archive: zip
             binary-suffix: ""
             cross: true
+          # Both macOS legs run on macos-latest (Apple Silicon). darwin-x64 is
+          # cross-compiled there and its smoke test runs under Rosetta 2,
+          # which the arm64 runner images include. macos-14 is not used: GitHub
+          # retires that image on 2026-11-02 and fails jobs on it during the
+          # brownouts before then (actions/runner-images#13518).
           - platform-label: darwin-x64
             runner: macos-latest
             target: x86_64-apple-darwin
             archive: zip
             binary-suffix: ""
           - platform-label: darwin-arm64
-            runner: macos-14
+            runner: macos-latest
             target: aarch64-apple-darwin
             archive: zip
             binary-suffix: ""
@@ -110,6 +125,29 @@ jobs:
             exit 1
           }
 
+      # Tabularis builds its own Linux packages against glibc 2.35 (Ubuntu
+      # 22.04) so they run on older LTS distros. The plugin is built on
+      # ubuntu-latest, so check that it needs no newer glibc than the host
+      # does. readelf reads both x86_64 and aarch64 binaries. A -linux-gnu
+      # binary always links glibc, so finding no version is an error (for
+      # example readelf failing), never a pass.
+      - name: Check glibc requirement (linux)
+        if: endsWith(matrix.target, '-linux-gnu')
+        run: |
+          set -o pipefail
+          max=2.35
+          needed=$(readelf -W --version-info staging/surrealdb-plugin \
+            | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -n 1) || needed=""
+          if [ -z "$needed" ]; then
+            echo "::error::Could not read a glibc version from surrealdb-plugin: readelf failed or listed none, and a ${{ matrix.target }} binary always needs one"
+            exit 1
+          fi
+          echo "surrealdb-plugin needs glibc $needed; Tabularis needs $max"
+          if [ "$(printf '%s\n%s\n' "$needed" "$max" | sort -V | tail -n 1)" != "$max" ]; then
+            echo "::error::surrealdb-plugin needs glibc $needed, newer than the $max Tabularis targets on Linux"
+            exit 1
+          fi
+
       - name: Smoke test binary (windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -132,6 +170,8 @@ jobs:
   release:
     name: Publish GitHub release
     needs: build
+    # Only for a pushed tag; a dry run stops after the builds.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
