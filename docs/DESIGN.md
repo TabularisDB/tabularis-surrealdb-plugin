@@ -338,7 +338,8 @@ because a notebook cell has a single error slot and hiding the error behind
 a later result would be worse.
 
 The editor's "run all" splits the script and calls `execute_query_batch`
-(M2). The plugin joins the statements into one `query` call, so `LET`
+(M2). The plugin joins the statements into one `query` call (with `;` on a
+line of its own, so a trailing `--` comment cannot swallow it), so `LET`
 variables and `BEGIN … COMMIT` work across them, and returns one result or
 error per statement: an error stays with its statement and the others still
 show. The host splits with a generic SQL splitter that can cut a SurrealQL

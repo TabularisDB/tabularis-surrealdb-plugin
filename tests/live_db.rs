@@ -778,6 +778,11 @@ fn batches_run_as_one_script_with_per_statement_results() {
     assert_eq!(out[4]["result"]["pagination"]["has_more"], true);
     assert!(out[1]["execution_time_ms"].as_f64().is_some());
 
+    // A trailing line comment does not swallow the next statement.
+    let out = run(&mut p, json!(["RETURN 1 -- note", "RETURN 2"]));
+    assert_eq!(out[0]["result"]["rows"], json!([[1]]), "{out}");
+    assert_eq!(out[1]["result"]["rows"], json!([[2]]), "{out}");
+
     // A function body the host's splitter cut at its inner `;`.
     let out = run(
         &mut p,

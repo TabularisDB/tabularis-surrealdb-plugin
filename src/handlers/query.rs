@@ -510,8 +510,10 @@ fn plan_batch(
                     .collect(),
             )
         };
+        // The `;` goes on a line of its own, so a trailing `--` comment in
+        // the previous entry cannot swallow it.
         if !script.is_empty() {
-            script.push_str(";\n");
+            script.push_str("\n;\n");
         }
         let start = script.len();
         script.push_str(&sql);
@@ -780,7 +782,7 @@ mod tests {
             batch(&["LET $n = 3", "SELECT * FROM item WHERE n < $n", "-- note"]);
         assert_eq!(
             script,
-            "LET $n = 3;\nSELECT * FROM item WHERE n < $n\nLIMIT 11 START 0"
+            "LET $n = 3\n;\nSELECT * FROM item WHERE n < $n\nLIMIT 11 START 0"
         );
         assert!(!uses_use);
         assert!(entries[2].sql.is_none());
@@ -788,6 +790,20 @@ mod tests {
             &script[entries[1].range.clone()],
             entries[1].sql.as_deref().unwrap()
         );
+    }
+
+    #[test]
+    fn batch_entries_ending_in_a_line_comment_keep_their_separator() {
+        let (script, entries, _) = batch(&["RETURN 1 -- note", "RETURN 2"]);
+        assert_eq!(script, "RETURN 1 -- note\n;\nRETURN 2");
+        assert_eq!(split_statements(&script).len(), 2);
+        let out = assign(
+            &script,
+            &entries,
+            vec![ok(Cbor::Integer(1.into())), ok(Cbor::Integer(2.into()))],
+        );
+        assert_eq!(out[0]["result"]["rows"], json!([[1]]));
+        assert_eq!(out[1]["result"]["rows"], json!([[2]]));
     }
 
     #[test]
