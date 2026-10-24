@@ -165,41 +165,52 @@ fn field<'a>(map: &'a Cbor, key: &str) -> Option<&'a Cbor> {
     }
 }
 
-fn count(value: Option<&Cbor>) -> Result<u64, PluginError> {
-    match value.map(to_cell) {
-        // A GROUP ALL over no rows returns no row on some versions.
-        None | Some(Json::Null) => Ok(0),
-        Some(Json::Number(n)) => n
-            .as_u64()
-            .or_else(|| n.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))
-            .ok_or_else(|| PluginError::internal(format!("unexpected count {n}"))),
-        Some(Json::String(s)) => s
-            .parse()
-            .map_err(|_| PluginError::internal(format!("unexpected count {s}"))),
-        Some(other) => Err(PluginError::internal(format!("unexpected count {other}"))),
-    }
+/// The error for a result that does not have the shape the script asks
+/// for. Nothing is defaulted, so a server that shapes a result differently
+/// shows an error instead of zeros.
+fn unexpected(what: &str, found: Option<&Cbor>) -> PluginError {
+    let found = found.map_or_else(|| "nothing".to_string(), |v| to_cell(v).to_string());
+    PluginError::internal(format!(
+        "SurrealDB returned an unexpected result for the column statistics: expected {what}, got {found}."
+    ))
 }
 
-/// The first row of a statement that returns rows, or the value itself.
-fn first_row(value: &Cbor) -> Option<&Cbor> {
-    match value {
-        Cbor::Array(items) => items.first(),
-        other => Some(other),
-    }
+/// A count: a whole, non-negative number.
+fn count(value: Option<&Cbor>, what: &str) -> Result<u64, PluginError> {
+    let parsed = match value.map(to_cell) {
+        Some(Json::Number(n)) => n.as_u64().or_else(|| {
+            n.as_f64()
+                .filter(|f| *f >= 0.0 && f.fract() == 0.0)
+                .map(|f| f as u64)
+        }),
+        // Integers beyond the JSON-safe range come back as text.
+        Some(Json::String(s)) => s.parse().ok(),
+        _ => None,
+    };
+    parsed.ok_or_else(|| unexpected(what, value))
 }
 
 /// Turn the statement results of [`build_script`] into the host's result.
+///
+/// Only the counts row may be missing (2.x returns no row for a `GROUP ALL`
+/// over no records, 3.x a zero row), and min / max may be NONE (an empty
+/// sample). Anything else that is missing or of the wrong type is an error.
 pub fn build_result(
     request: &StatsRequest,
     values: &[Cbor],
     sample_size: u64,
 ) -> Result<Json, PluginError> {
-    let counts = values
-        .first()
-        .ok_or_else(|| PluginError::internal("SurrealDB returned no result"))?;
-    let counts_row = first_row(counts);
-    let rows = count(counts_row.and_then(|r| field(r, "rows")))?;
-    let nulls = count(counts_row.and_then(|r| field(r, "nulls")))?.min(rows);
+    let (rows, nulls) = match values.first() {
+        Some(Cbor::Array(items)) => match items.first() {
+            None => (0, 0),
+            Some(row) => (
+                count(field(row, "rows"), "a `rows` count")?,
+                count(field(row, "nulls"), "a `nulls` count")?,
+            ),
+        },
+        other => return Err(unexpected("the counts row", other)),
+    };
+    let nulls = nulls.min(rows);
 
     let mut result = json!({
         "row_count": rows,
@@ -213,12 +224,13 @@ pub fn build_result(
         return Ok(result);
     }
     // values[1] is the LET (NONE), values[2] the RETURN object.
-    let summary = values
-        .get(2)
-        .ok_or_else(|| PluginError::internal("SurrealDB returned too few results"))?;
-    let sampled = count(field(summary, "sampled"))?;
+    let summary = match values.get(2) {
+        Some(map @ Cbor::Map(_)) => map,
+        other => return Err(unexpected("the summary object", other)),
+    };
+    let sampled = count(field(summary, "sampled"), "a `sampled` count")?;
     if request.distinct {
-        result["distinct_count"] = json!(count(field(summary, "distinct"))?);
+        result["distinct_count"] = json!(count(field(summary, "distinct"), "a `distinct` count")?);
     }
     if request.min_max {
         let value = |key| field(summary, key).map(to_cell).unwrap_or(Json::Null);
@@ -229,15 +241,15 @@ pub fn build_result(
         let top = match values.get(3) {
             Some(Cbor::Array(items)) => items
                 .iter()
-                .filter_map(|row| {
-                    let value = field(row, "v").filter(|v| !is_none(v) && !v.is_null())?;
-                    Some(
-                        count(field(row, "count"))
-                            .map(|n| json!({ "value": to_cell(value), "count": n })),
-                    )
+                .map(|row| {
+                    let value = field(row, "v")
+                        .filter(|v| !is_none(v) && !v.is_null())
+                        .ok_or_else(|| unexpected("a top value", Some(row)))?;
+                    let n = count(field(row, "count"), "a top value count")?;
+                    Ok(json!({ "value": to_cell(value), "count": n }))
                 })
-                .collect::<Result<Vec<_>, _>>()?,
-            _ => Vec::new(),
+                .collect::<Result<Vec<_>, PluginError>>()?,
+            other => return Err(unexpected("the top values", other)),
         };
         result["top_values"] = Json::Array(top);
     }
@@ -459,7 +471,7 @@ mod tests {
         // 2.x returns no row for a GROUP ALL over no rows, 3.x a zero row.
         for counts in [
             Cbor::Array(vec![]),
-            Cbor::Array(vec![map(&[("rows", int(0))])]),
+            Cbor::Array(vec![map(&[("rows", int(0)), ("nulls", int(0))])]),
         ] {
             let values = [
                 counts,
@@ -497,5 +509,83 @@ mod tests {
                     "min": null, "max": null, "top_values": null })
         );
         assert!(build_result(&request(None), &values, 1000).is_err());
+    }
+
+    #[test]
+    fn unexpected_shapes_are_errors_not_zeros() {
+        let counts = Cbor::Array(vec![map(&[("rows", int(5)), ("nulls", int(1))])]);
+        let summary = || {
+            map(&[
+                ("sampled", int(4)),
+                ("distinct", int(3)),
+                ("min", int(1)),
+                ("max", int(9)),
+            ])
+        };
+        let top = || Cbor::Array(vec![map(&[("v", int(5)), ("count", int(2))])]);
+        let r = request(None);
+        assert!(build_result(&r, &[counts.clone(), none(), summary(), top()], 1000).is_ok());
+
+        let broken: Vec<(&str, Vec<Cbor>)> = vec![
+            ("counts not rows", vec![int(5)]),
+            (
+                "count row without nulls",
+                vec![
+                    Cbor::Array(vec![map(&[("rows", int(5))])]),
+                    none(),
+                    summary(),
+                    top(),
+                ],
+            ),
+            ("no summary", vec![counts.clone(), none()]),
+            (
+                "summary not an object",
+                vec![counts.clone(), none(), int(1), top()],
+            ),
+            (
+                "no sampled",
+                vec![counts.clone(), none(), map(&[("distinct", int(3))]), top()],
+            ),
+            (
+                "distinct of the wrong type",
+                vec![
+                    counts.clone(),
+                    none(),
+                    map(&[("sampled", int(4)), ("distinct", Cbor::Text("many".into()))]),
+                    top(),
+                ],
+            ),
+            ("no top values", vec![counts.clone(), none(), summary()]),
+            (
+                "top values not an array",
+                vec![counts.clone(), none(), summary(), none()],
+            ),
+            (
+                "top value without count",
+                vec![
+                    counts.clone(),
+                    none(),
+                    summary(),
+                    Cbor::Array(vec![map(&[("v", int(5))])]),
+                ],
+            ),
+            (
+                "top value without value",
+                vec![
+                    counts.clone(),
+                    none(),
+                    summary(),
+                    Cbor::Array(vec![map(&[("count", int(2))])]),
+                ],
+            ),
+        ];
+        for (case, values) in broken {
+            let e = build_result(&r, &values, 1000).unwrap_err();
+            assert!(
+                e.message.contains("unexpected result"),
+                "{case}: {}",
+                e.message
+            );
+        }
     }
 }

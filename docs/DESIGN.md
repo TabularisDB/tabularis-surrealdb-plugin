@@ -393,7 +393,11 @@ Only the parts the host asked for are added. Choices:
   the grid, which runs it as typed, and the editor runs anything; all of it
   runs with the signed-in user's permissions.
 - **Empty results.** 2.x returns no row for a `GROUP ALL` over nothing, 3.x
-  a zero row; both read as 0.
+  a zero row; both read as 0. That row is the only result allowed to be
+  missing, and min / max the only values allowed to be NONE (an empty
+  sample). A missing or mistyped `sampled`, `distinct` or top-values result
+  is an error naming what was expected, not a zero or an empty list, so a
+  server that shapes a result differently cannot show wrong statistics.
 - **Timeout.** With the query timeout setting on, every SELECT of the
   script (the counts, the sample inside `LET`, the top values) ends in
   `TIMEOUT <n>s`, so the server stops it and answers with its timeout
