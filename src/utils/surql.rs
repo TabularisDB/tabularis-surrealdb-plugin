@@ -311,8 +311,6 @@ fn ends_with_ignore_case(s: &str, suffix: &str) -> bool {
         && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
-/// True when brackets in `sql` (outside strings and comments) balance and
-/// never close below zero.
 /// True when `sql` has the shape of one expression: brackets, quotes and
 /// regex literals balance, and there is no top-level `;`. It can then be
 /// embedded as `WHERE (<sql>\n)` without changing the shape of the
@@ -325,6 +323,8 @@ pub fn is_single_expression(sql: &str) -> bool {
     is_balanced(sql) && split_statements(sql).len() <= 1
 }
 
+/// True when brackets in `sql` (outside strings, comments and regex
+/// literals) balance and never close below zero.
 pub fn is_balanced(sql: &str) -> bool {
     let mut scanner = Scanner::new(sql);
     while scanner.next_event().is_some() {
