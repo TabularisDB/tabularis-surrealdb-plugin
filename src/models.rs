@@ -13,6 +13,10 @@
 //!
 //! `extra.auth_level` (`auto`, `root`, `namespace`, `database`, `token`,
 //! `none`) can pin the sign-in level; `auto` is the default.
+//!
+//! TLS comes from the connection's SSL tab: `ssl_mode` (`disabled`,
+//! `preferred`, `required`, `verify_ca`, `verify_identity`) and `ssl_ca`.
+//! See [`TlsSettings`].
 
 use serde_json::Value;
 
@@ -29,6 +33,10 @@ pub struct ConnectionParams {
     pub username: Option<String>,
     pub password: Option<String>,
     pub auth_level: Option<String>,
+    pub ssl_mode: Option<String>,
+    pub ssl_ca: Option<String>,
+    pub ssl_cert: Option<String>,
+    pub ssl_key: Option<String>,
     /// Stable id of the Tabularis connection, when the host has one (it does
     /// not for "Test connection" on an unsaved connection).
     pub connection_id: Option<String>,
@@ -73,6 +81,10 @@ impl ConnectionParams {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
             auth_level,
+            ssl_mode: get_str("ssl_mode"),
+            ssl_ca: get_str("ssl_ca"),
+            ssl_cert: get_str("ssl_cert"),
+            ssl_key: get_str("ssl_key"),
             connection_id: get_str("connection_id"),
         }
     }
@@ -116,12 +128,58 @@ pub struct SessionConfig {
     pub username: Option<String>,
     pub password: Option<String>,
     pub auth: AuthLevel,
+    pub tls: TlsSettings,
     pub connection_id: Option<String>,
+}
+
+/// How a `wss://` connection checks the server certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TlsVerify {
+    /// Chain to a trusted root and match the host name (the default).
+    #[default]
+    Full,
+    /// Chain to a trusted root, any host name (SSL mode "Verify CA").
+    CaOnly,
+    /// Encrypt without checking the certificate (SSL mode "Required").
+    None,
+}
+
+/// TLS options for one connection. Trusted roots are the PEM file in
+/// `ca_file` when set (and nothing else), or the bundled Mozilla roots.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct TlsSettings {
+    pub verify: TlsVerify,
+    pub ca_file: Option<String>,
 }
 
 impl SessionConfig {
     pub fn from_params(params: &ConnectionParams) -> Result<Self, PluginError> {
-        let url = rpc_url(params.host.as_deref(), params.port)?;
+        let mode = ssl_mode(params.ssl_mode.as_deref())?;
+        if params.ssl_cert.is_some() || params.ssl_key.is_some() {
+            return Err(PluginError::invalid_params(
+                "Client certificates are not supported: SurrealDB signs in with users or tokens. Clear the client certificate and key in the SSL tab.",
+            ));
+        }
+        let mut url = rpc_url(params.host.as_deref(), params.port)?;
+        let host_has_scheme = params.host.as_deref().is_some_and(|h| h.contains("://"));
+        let (tls_on, verify) = match mode {
+            // An empty SSL mode is what the host's SSL tab shows for it:
+            // Required, the MySQL-dialect default (also Tabularis's own MySQL
+            // driver's). A URL in Host names its own scheme: `ws://` stays
+            // plain and `wss://` gets full verification.
+            SslMode::Unset if host_has_scheme => (false, TlsVerify::Full),
+            SslMode::Unset => (true, TlsVerify::None),
+            SslMode::Off => (false, TlsVerify::Full),
+            SslMode::Tls(verify) => (true, verify),
+        };
+        if tls_on && url.starts_with("ws://") {
+            if host_has_scheme {
+                return Err(PluginError::invalid_params(
+                    "Host is a ws:// URL but the SSL mode asks for TLS. Use a wss:// URL, or set SSL mode to Disabled.",
+                ));
+            }
+            url = format!("wss://{}", &url["ws://".len()..]);
+        }
         let (namespace, database) = split_namespace_database(params.database.as_deref());
         let auth = resolve_auth_level(params)?;
         if matches!(auth, AuthLevel::Namespace) && namespace.is_none() {
@@ -141,6 +199,10 @@ impl SessionConfig {
             username: params.username.clone(),
             password: params.password.clone(),
             auth,
+            tls: TlsSettings {
+                verify,
+                ca_file: params.ssl_ca.clone(),
+            },
             connection_id: params.connection_id.clone(),
         })
     }
@@ -172,6 +234,35 @@ pub fn split_namespace_database(value: Option<&str>) -> (Option<String>, Option<
         }
         None => (Some(value.to_string()), None),
     }
+}
+
+/// The SSL tab's mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SslMode {
+    /// Empty: the host does not send one. Its form shows Required.
+    Unset,
+    /// Disabled or Preferred: no TLS for a bare host name.
+    Off,
+    /// TLS with this certificate check.
+    Tls(TlsVerify),
+}
+
+/// Parse the SSL mode. Accepts the MySQL-style names the host offers for
+/// this driver and the PostgreSQL spellings.
+fn ssl_mode(mode: Option<&str>) -> Result<SslMode, PluginError> {
+    let mode = mode.map(|m| m.trim().to_ascii_lowercase().replace('-', "_"));
+    Ok(match mode.as_deref() {
+        None | Some("") => SslMode::Unset,
+        Some("disabled" | "disable" | "preferred" | "prefer" | "allow") => SslMode::Off,
+        Some("required" | "require") => SslMode::Tls(TlsVerify::None),
+        Some("verify_ca") => SslMode::Tls(TlsVerify::CaOnly),
+        Some("verify_identity" | "verify_full") => SslMode::Tls(TlsVerify::Full),
+        Some(other) => {
+            return Err(PluginError::invalid_params(format!(
+                "Unknown SSL mode `{other}`."
+            )))
+        }
+    })
 }
 
 fn resolve_auth_level(params: &ConnectionParams) -> Result<AuthLevel, PluginError> {
@@ -325,6 +416,58 @@ mod tests {
         );
         assert!(rpc_url(Some("ftp://x"), None).is_err());
         assert!(rpc_url(Some("host/path"), None).is_err());
+    }
+
+    #[test]
+    fn ssl_modes_select_tls_and_verification() {
+        let cfg = |host: &str, mode: Option<&str>| {
+            SessionConfig::from_params(&ConnectionParams {
+                host: Some(host.into()),
+                ssl_mode: mode.map(Into::into),
+                ssl_ca: Some("/tmp/ca.pem".into()),
+                ..Default::default()
+            })
+        };
+        // Empty means Required, as the SSL tab shows it.
+        let c = cfg("localhost", None).unwrap();
+        assert_eq!(c.url, "wss://localhost:8000/rpc");
+        assert_eq!(c.tls.verify, TlsVerify::None);
+        assert_eq!(cfg("localhost", Some(" ")).unwrap().tls, c.tls);
+        let c = cfg("localhost", Some("disabled")).unwrap();
+        assert_eq!(c.url, "ws://localhost:8000/rpc");
+        let c = cfg("localhost", Some("preferred")).unwrap();
+        assert!(c.url.starts_with("ws://"));
+        let c = cfg("localhost", Some("required")).unwrap();
+        assert_eq!(c.url, "wss://localhost:8000/rpc");
+        assert_eq!(c.tls.verify, TlsVerify::None);
+        assert_eq!(c.tls.ca_file.as_deref(), Some("/tmp/ca.pem"));
+        assert_eq!(
+            cfg("localhost", Some("verify_ca")).unwrap().tls.verify,
+            TlsVerify::CaOnly
+        );
+        assert_eq!(
+            cfg("localhost", Some("verify-full")).unwrap().tls.verify,
+            TlsVerify::Full
+        );
+        // A wss:// URL is TLS whatever the mode says; a ws:// URL conflicts
+        // with a TLS mode.
+        let c = cfg("wss://db.example.com", None).unwrap();
+        assert!(c.url.starts_with("wss://"));
+        assert_eq!(c.tls.verify, TlsVerify::Full);
+        assert!(cfg("ws://db.example.com", Some("required")).is_err());
+        // With an empty mode, a URL's scheme decides.
+        let c = cfg("ws://127.0.0.1:8000", None).unwrap();
+        assert_eq!(c.url, "ws://127.0.0.1:8000/rpc");
+        assert!(cfg("localhost", Some("bogus")).is_err());
+        let client_cert = SessionConfig::from_params(&ConnectionParams {
+            ssl_mode: Some("required".into()),
+            ssl_cert: Some("/tmp/c.pem".into()),
+            ..Default::default()
+        });
+        assert!(client_cert
+            .unwrap_err()
+            .message
+            .contains("Client certificates"));
     }
 
     #[test]

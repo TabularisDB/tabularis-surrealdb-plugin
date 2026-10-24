@@ -27,6 +27,10 @@ live-test:
     SURREAL_URL=ws://127.0.0.1:8000 SURREAL_USER=root SURREAL_PASS=root SURREAL_NS=test SURREAL_DB=test \
         cargo test --test live_db -- --test-threads=1
 
+# Run the live TLS test (starts its own TLS SurrealDB with a throwaway CA; needs surreal and openssl).
+tls-test:
+    cargo test --test live_tls
+
 # Launch the local REPL that simulates Tabularis JSON-RPC calls over stdio.
 repl:
     cargo run --bin test_plugin

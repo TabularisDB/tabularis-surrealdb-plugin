@@ -107,13 +107,28 @@ fn tabulate_records(records: &[&[(Cbor, Cbor)]]) -> Table {
 
 /// Serialise into the host's `QueryResult` shape.
 pub fn query_result(table: Table, pagination: Option<Json>) -> Json {
-    json!({
+    query_result_with(table, pagination, 0, None)
+}
+
+/// [`query_result`] with an affected-row count and the server's execution
+/// time for the statement.
+pub fn query_result_with(
+    table: Table,
+    pagination: Option<Json>,
+    affected_rows: u64,
+    server_time_ms: Option<f64>,
+) -> Json {
+    let mut out = json!({
         "columns": table.columns,
         "rows": table.rows,
-        "affected_rows": 0,
+        "affected_rows": affected_rows,
         "truncated": false,
         "pagination": pagination,
-    })
+    });
+    if let Some(ms) = server_time_ms {
+        out["server_time_ms"] = json!(ms);
+    }
+    out
 }
 
 pub fn pagination(page: u64, page_size: u64, has_more: bool) -> Json {

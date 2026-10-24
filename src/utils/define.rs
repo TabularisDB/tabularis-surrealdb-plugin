@@ -14,6 +14,9 @@ pub struct TableDef {
     pub schemafull: bool,
     /// `TYPE RELATION`: a graph edge table with `in` / `out` fields.
     pub relation: bool,
+    /// Tables allowed for `in` / `out` (`IN a | b OUT c`, or `FROM … TO …`).
+    pub relation_in: Vec<String>,
+    pub relation_out: Vec<String>,
     /// `DEFINE TABLE … AS SELECT …`: a pre-computed table view.
     pub view: bool,
     pub comment: Option<String>,
@@ -90,7 +93,12 @@ pub fn parse_table(def: &str) -> TableDef {
                 out.relation = value
                     .split_whitespace()
                     .next()
-                    .is_some_and(|w| w.eq_ignore_ascii_case("RELATION"))
+                    .is_some_and(|w| w.eq_ignore_ascii_case("RELATION"));
+                if out.relation {
+                    let (ins, outs) = relation_targets(value);
+                    out.relation_in = ins;
+                    out.relation_out = outs;
+                }
             }
             "AS" => out.view = true,
             "COMMENT" => out.comment = unquote_string(value),
@@ -136,6 +144,88 @@ pub fn parse_index(def: &str) -> IndexDef {
         }
     }
     out
+}
+
+/// `RELATION IN a | b OUT c ENFORCED` → (["a", "b"], ["c"]).
+fn relation_targets(type_clause: &str) -> (Vec<String>, Vec<String>) {
+    let mut ins = Vec::new();
+    let mut outs = Vec::new();
+    let mut side: Option<bool> = None; // Some(true) = in, Some(false) = out
+    for word in type_clause.split(|c: char| c.is_whitespace() || c == '|') {
+        if word.is_empty() {
+            continue;
+        }
+        match word.to_ascii_uppercase().as_str() {
+            "RELATION" => {}
+            "IN" | "FROM" => side = Some(true),
+            "OUT" | "TO" => side = Some(false),
+            "ENFORCED" => side = None,
+            _ => match side {
+                Some(true) => ins.push(unquote_identifier(word)),
+                Some(false) => outs.push(unquote_identifier(word)),
+                None => {}
+            },
+        }
+    }
+    (ins, outs)
+}
+
+/// Tables a field type links to: `record<a>`, `option<record<a | b>>`,
+/// `none | record<a>`. Arrays and sets of records are not links of the field
+/// itself and return nothing; so does a bare `record` (any table).
+pub fn record_link_targets(kind: &str) -> Vec<String> {
+    let mut k = kind.trim();
+    if let Some(inner) = strip_wrapper(k, "option") {
+        k = inner;
+    }
+    let parts: Vec<&str> = split_top_level_pipes(k)
+        .into_iter()
+        .map(str::trim)
+        .filter(|p| !p.eq_ignore_ascii_case("none") && !p.eq_ignore_ascii_case("null"))
+        .collect();
+    if parts.len() != 1 {
+        return Vec::new();
+    }
+    match strip_wrapper(parts[0], "record") {
+        Some(tables) => tables
+            .split('|')
+            .map(|t| unquote_identifier(t.trim()))
+            .filter(|t| !t.is_empty())
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Split a type union on `|` outside angle brackets.
+fn split_top_level_pipes(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut last = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            '|' if depth == 0 => {
+                parts.push(&s[last..i]);
+                last = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[last..]);
+    parts
+}
+
+/// `name<inner>` → `inner` (case-insensitive name).
+fn strip_wrapper<'a>(s: &'a str, name: &str) -> Option<&'a str> {
+    let head = s.get(..name.len())?;
+    if !head.eq_ignore_ascii_case(name) {
+        return None;
+    }
+    s[name.len()..]
+        .trim_start()
+        .strip_prefix('<')?
+        .strip_suffix('>')
 }
 
 fn non_empty(s: String) -> Option<String> {
@@ -375,6 +465,8 @@ mod tests {
             TableDef {
                 schemafull: true,
                 relation: false,
+                relation_in: vec![],
+                relation_out: vec![],
                 view: false,
                 comment: Some("People".into())
             }
@@ -383,6 +475,11 @@ mod tests {
             "DEFINE TABLE knows TYPE RELATION IN person OUT person SCHEMALESS PERMISSIONS NONE",
         );
         assert!(r.relation && !r.schemafull);
+        assert_eq!(r.relation_in, vec!["person"]);
+        assert_eq!(r.relation_out, vec!["person"]);
+        let r = parse_table("DEFINE TABLE likes TYPE RELATION FROM person | bot TO post ENFORCED");
+        assert_eq!(r.relation_in, vec!["person", "bot"]);
+        assert_eq!(r.relation_out, vec!["post"]);
         let odd = parse_table("DEFINE TABLE `odd table` TYPE ANY SCHEMALESS PERMISSIONS NONE");
         assert!(!odd.schemafull && !odd.relation);
         let view = parse_table(
@@ -461,6 +558,28 @@ mod tests {
         assert_eq!(f.default.as_deref(), Some("'COMMENT READONLY'"));
         assert!(!f.readonly);
         assert_eq!(f.comment, None);
+    }
+
+    #[test]
+    fn record_link_targets_from_types() {
+        assert_eq!(record_link_targets("record<person>"), vec!["person"]);
+        assert_eq!(
+            record_link_targets("option<record<person>>"),
+            vec!["person"]
+        );
+        assert_eq!(record_link_targets("none | record<person>"), vec!["person"]);
+        assert_eq!(
+            record_link_targets("record<person | bot>"),
+            vec!["person", "bot"]
+        );
+        assert_eq!(
+            record_link_targets("record<`odd table`>"),
+            vec!["odd table"]
+        );
+        assert!(record_link_targets("record").is_empty());
+        assert!(record_link_targets("array<record<tag>>").is_empty());
+        assert!(record_link_targets("string").is_empty());
+        assert!(record_link_targets("record<a> | string").is_empty());
     }
 
     #[test]

@@ -63,6 +63,8 @@ pub enum ConnectError {
     Http(u16),
     Io(String),
     Tls(String),
+    /// The TLS settings themselves are unusable (e.g. unreadable CA file).
+    TlsConfig(String),
     InvalidUrl(String),
     Other(String),
 }
@@ -79,8 +81,13 @@ pub struct RpcClient {
 }
 
 impl RpcClient {
-    /// Open a WebSocket to `url` negotiating the `cbor` subprotocol.
-    pub async fn connect(url: &str, timeout: Duration) -> Result<Self, ConnectError> {
+    /// Open a WebSocket to `url` negotiating the `cbor` subprotocol. `tls`
+    /// applies to `wss://` URLs.
+    pub async fn connect(
+        url: &str,
+        timeout: Duration,
+        tls: &crate::models::TlsSettings,
+    ) -> Result<Self, ConnectError> {
         let mut request = url
             .into_client_request()
             .map_err(|e| ConnectError::InvalidUrl(e.to_string()))?;
@@ -88,7 +95,15 @@ impl RpcClient {
             .headers_mut()
             .insert("Sec-WebSocket-Protocol", HeaderValue::from_static("cbor"));
 
-        let connect = tokio_tungstenite::connect_async(request);
+        let connector = if url.starts_with("wss://") {
+            let config =
+                crate::surreal::tls::client_config(tls).map_err(ConnectError::TlsConfig)?;
+            Some(tokio_tungstenite::Connector::Rustls(Arc::new(config)))
+        } else {
+            None
+        };
+        let connect =
+            tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector);
         let (stream, _response) = match tokio::time::timeout(timeout, connect).await {
             Err(_) => return Err(ConnectError::Timeout(timeout)),
             Ok(Err(e)) => return Err(classify_connect_error(e)),
@@ -295,6 +310,19 @@ fn classify_connect_error(e: tokio_tungstenite::tungstenite::Error) -> ConnectEr
     use tokio_tungstenite::tungstenite::Error as WsError;
     match e {
         WsError::Http(response) => ConnectError::Http(response.status().as_u16()),
+        // rustls reports certificate and handshake failures as I/O errors.
+        WsError::Io(io)
+            if {
+                let m = io.to_string().to_ascii_lowercase();
+                m.contains("certificate")
+                    || m.contains("handshake")
+                    || m.contains("tls")
+                    // A plain-text answer to a TLS client hello.
+                    || m.contains("corrupt message")
+            } =>
+        {
+            ConnectError::Tls(io.to_string())
+        }
         WsError::Io(io) => ConnectError::Io(io.to_string()),
         WsError::Tls(tls) => ConnectError::Tls(tls.to_string()),
         WsError::Url(url) => ConnectError::InvalidUrl(url.to_string()),
