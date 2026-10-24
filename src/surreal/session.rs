@@ -49,6 +49,9 @@ pub struct Session {
     client: RpcClient,
     pub config: SessionConfig,
     pub signed_in_as: AuthLevel,
+    /// Major version of the server (`2`, `3`), read once when the session
+    /// opens. `None` when the server did not say.
+    pub server_major: Option<u64>,
 }
 
 impl Session {
@@ -59,11 +62,21 @@ impl Session {
             .await
             .map_err(|e| errors::connect_error(&config.url, &e))?;
         let signed_in_as = bounded("signing in", sign_in(&client, config)).await??;
-        let session = Self {
+        let mut session = Self {
             client,
             config: config.clone(),
             signed_in_as,
+            server_major: None,
         };
+        // Best effort: statement results are shaped slightly differently on
+        // 2.x (see `handlers::query::Answers`), but a server that does not
+        // answer `version` can still be used.
+        session.server_major = bounded("reading the server version", session.version())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .as_deref()
+            .and_then(major_version);
         if config.namespace.is_some() {
             let target = config.target();
             bounded(
@@ -409,6 +422,17 @@ pub fn parse_duration_ms(text: &str) -> Option<f64> {
     Some(value * factor)
 }
 
+/// Major version from a version text such as `surrealdb-2.7.0` or
+/// `surrealdb-3.2.6+20261018.c63e805`.
+pub fn major_version(text: &str) -> Option<u64> {
+    let rest = text
+        .trim()
+        .strip_prefix("surrealdb-")
+        .unwrap_or(text.trim());
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
 fn version_text(value: &Cbor) -> String {
     match value {
         Cbor::Text(t) => t.clone(),
@@ -555,5 +579,13 @@ mod tests {
             version_text(&map(vec![("version", Cbor::Text("3.2.3".into()))])),
             "surrealdb-3.2.3"
         );
+    }
+
+    #[test]
+    fn major_version_from_version_text() {
+        assert_eq!(major_version("surrealdb-2.7.0"), Some(2));
+        assert_eq!(major_version("surrealdb-3.2.6+20261018.c63e805"), Some(3));
+        assert_eq!(major_version("3.0.0"), Some(3));
+        assert_eq!(major_version("surrealdb-beta"), None);
     }
 }

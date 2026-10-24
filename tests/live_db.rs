@@ -826,6 +826,10 @@ fn result_shapes_writes_and_empty_results() {
     assert!(r["server_time_ms"].as_f64().is_some());
     let r = query(&mut p, &conn, "DELETE scratch");
     assert_eq!(r["affected_rows"], 0, "DELETE returns nothing by default");
+    // Inside a transaction too (2.x answers BEGIN and COMMIT with no entry).
+    let r = query(&mut p, &conn, "BEGIN; CREATE scratch:t SET v = 3; COMMIT;");
+    assert_eq!(r["affected_rows"], 1, "{r}");
+    query(&mut p, &conn, "DELETE scratch");
 
     // Statements that return nothing do not hide the result in a notebook
     // cell (which shows the primary result only).

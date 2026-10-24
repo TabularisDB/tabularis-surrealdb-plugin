@@ -333,6 +333,13 @@ the piece where it ends while the other pieces show an empty result. Each
 result carries the server's execution time (`execution_time_ms`, and
 `server_time_ms` on the result).
 
+Results are matched to statements by position. SurrealDB 2.x adds no
+result entry for `BEGIN`, `COMMIT`, `CANCEL` and `OPTION` (3.x answers
+every statement), so the plugin reads the server version when a session
+opens and, on 2.x, leaves those statements out when lining results up. This
+applies to both `execute_query` (affected rows, paging, the failing
+statement's position) and `execute_query_batch`.
+
 `affected_rows` (M2): for CREATE, INSERT, UPDATE, UPSERT, DELETE and RELATE,
 the number of records the statement returned. The host shows it only when
 there is no result grid. DELETE returns nothing by default, so it reports no
