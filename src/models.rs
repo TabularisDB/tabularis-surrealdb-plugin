@@ -154,7 +154,7 @@ pub struct TlsSettings {
 
 impl SessionConfig {
     pub fn from_params(params: &ConnectionParams) -> Result<Self, PluginError> {
-        let (tls_on, verify) = ssl_mode(params.ssl_mode.as_deref())?;
+        let mode = ssl_mode(params.ssl_mode.as_deref())?;
         if params.ssl_cert.is_some() || params.ssl_key.is_some() {
             return Err(PluginError::invalid_params(
                 "Client certificates are not supported: SurrealDB signs in with users or tokens. Clear the client certificate and key in the SSL tab.",
@@ -162,6 +162,16 @@ impl SessionConfig {
         }
         let mut url = rpc_url(params.host.as_deref(), params.port)?;
         let host_has_scheme = params.host.as_deref().is_some_and(|h| h.contains("://"));
+        let (tls_on, verify) = match mode {
+            // An empty SSL mode is what the host's SSL tab shows for it:
+            // Required, the MySQL-dialect default (also Tabularis's own MySQL
+            // driver's). A URL in Host names its own scheme: `ws://` stays
+            // plain and `wss://` gets full verification.
+            SslMode::Unset if host_has_scheme => (false, TlsVerify::Full),
+            SslMode::Unset => (true, TlsVerify::None),
+            SslMode::Off => (false, TlsVerify::Full),
+            SslMode::Tls(verify) => (true, verify),
+        };
         if tls_on && url.starts_with("ws://") {
             if host_has_scheme {
                 return Err(PluginError::invalid_params(
@@ -226,18 +236,27 @@ pub fn split_namespace_database(value: Option<&str>) -> (Option<String>, Option<
     }
 }
 
-/// SSL mode → (use TLS for a bare host name, certificate check). Accepts the
-/// MySQL-style names the host offers for this driver and the PostgreSQL
-/// spellings.
-fn ssl_mode(mode: Option<&str>) -> Result<(bool, TlsVerify), PluginError> {
+/// The SSL tab's mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SslMode {
+    /// Empty: the host does not send one. Its form shows Required.
+    Unset,
+    /// Disabled or Preferred: no TLS for a bare host name.
+    Off,
+    /// TLS with this certificate check.
+    Tls(TlsVerify),
+}
+
+/// Parse the SSL mode. Accepts the MySQL-style names the host offers for
+/// this driver and the PostgreSQL spellings.
+fn ssl_mode(mode: Option<&str>) -> Result<SslMode, PluginError> {
     let mode = mode.map(|m| m.trim().to_ascii_lowercase().replace('-', "_"));
     Ok(match mode.as_deref() {
-        None | Some("") | Some("disabled" | "disable" | "preferred" | "prefer" | "allow") => {
-            (false, TlsVerify::Full)
-        }
-        Some("required" | "require") => (true, TlsVerify::None),
-        Some("verify_ca") => (true, TlsVerify::CaOnly),
-        Some("verify_identity" | "verify_full") => (true, TlsVerify::Full),
+        None | Some("") => SslMode::Unset,
+        Some("disabled" | "disable" | "preferred" | "prefer" | "allow") => SslMode::Off,
+        Some("required" | "require") => SslMode::Tls(TlsVerify::None),
+        Some("verify_ca") => SslMode::Tls(TlsVerify::CaOnly),
+        Some("verify_identity" | "verify_full") => SslMode::Tls(TlsVerify::Full),
         Some(other) => {
             return Err(PluginError::invalid_params(format!(
                 "Unknown SSL mode `{other}`."
@@ -409,7 +428,12 @@ mod tests {
                 ..Default::default()
             })
         };
+        // Empty means Required, as the SSL tab shows it.
         let c = cfg("localhost", None).unwrap();
+        assert_eq!(c.url, "wss://localhost:8000/rpc");
+        assert_eq!(c.tls.verify, TlsVerify::None);
+        assert_eq!(cfg("localhost", Some(" ")).unwrap().tls, c.tls);
+        let c = cfg("localhost", Some("disabled")).unwrap();
         assert_eq!(c.url, "ws://localhost:8000/rpc");
         let c = cfg("localhost", Some("preferred")).unwrap();
         assert!(c.url.starts_with("ws://"));
@@ -427,11 +451,13 @@ mod tests {
         );
         // A wss:// URL is TLS whatever the mode says; a ws:// URL conflicts
         // with a TLS mode.
-        assert!(cfg("wss://db.example.com", None)
-            .unwrap()
-            .url
-            .starts_with("wss://"));
+        let c = cfg("wss://db.example.com", None).unwrap();
+        assert!(c.url.starts_with("wss://"));
+        assert_eq!(c.tls.verify, TlsVerify::Full);
         assert!(cfg("ws://db.example.com", Some("required")).is_err());
+        // With an empty mode, a URL's scheme decides.
+        let c = cfg("ws://127.0.0.1:8000", None).unwrap();
+        assert_eq!(c.url, "ws://127.0.0.1:8000/rpc");
         assert!(cfg("localhost", Some("bogus")).is_err());
         let client_cert = SessionConfig::from_params(&ConnectionParams {
             ssl_mode: Some("required".into()),

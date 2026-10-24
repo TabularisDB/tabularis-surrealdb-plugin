@@ -26,6 +26,14 @@ pub fn connect_error(url: &str, error: &ConnectError) -> PluginError {
             format!("Could not resolve the host in {url}: {io}")
         }
         ConnectError::Io(io) => format!("Could not connect to SurrealDB at {url}: {io}"),
+        ConnectError::Tls(tls)
+            if tls.to_ascii_lowercase().contains("corrupt message")
+                || tls.contains("InvalidContentType") =>
+        {
+            format!(
+                "{url} answered without TLS ({tls}): the server does not use TLS on this port. Set SSL mode to Disabled in the SSL tab (an empty SSL mode means Required, as the tab shows), or put a ws:// URL in Host."
+            )
+        }
         ConnectError::Tls(tls) => format!(
             "TLS handshake with {url} failed: {tls}. For a server with a private or self-signed certificate, set its CA certificate file in the SSL tab (SSL mode Verify CA or Verify Identity), or use SSL mode Required to encrypt without checking the certificate. For a server without TLS, use SSL mode Disabled or a ws:// URL."
         ),
@@ -194,6 +202,16 @@ mod tests {
         assert!(timeout.message.contains("Timed out after 10s"));
         let tls = connect_error("wss://x/rpc", &ConnectError::Tls("bad cert".into()));
         assert!(tls.message.contains("wss://"));
+        let plain = connect_error(
+            "wss://localhost:8000/rpc",
+            &ConnectError::Tls("received corrupt message of type InvalidContentType".into()),
+        );
+        assert!(
+            plain.message.contains("does not use TLS"),
+            "{}",
+            plain.message
+        );
+        assert!(plain.message.contains("Disabled"));
     }
 
     #[test]

@@ -287,6 +287,8 @@ fn unreachable_server_is_reported() {
     let mut conn = connection(&e, &main_db(&e), "nowhere");
     conn["host"] = json!("127.0.0.1");
     conn["port"] = json!(1);
+    // An empty SSL mode would mean Required (wss://).
+    conn["ssl_mode"] = json!("disabled");
     let (_, message) = p
         .call("test_connection", json!({ "params": conn }))
         .unwrap_err();

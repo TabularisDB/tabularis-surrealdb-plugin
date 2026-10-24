@@ -244,6 +244,8 @@ fn wss_with_private_ca_and_ssl_modes() {
         connection("127.0.0.1", port, Some("required"), None),
     )
     .unwrap();
+    // An empty SSL mode is Required, as the host's SSL tab shows it.
+    test(&mut p, connection("127.0.0.1", port, None, None)).unwrap();
 
     // Plain ws:// to a TLS port fails cleanly.
     let (_, message) = test(

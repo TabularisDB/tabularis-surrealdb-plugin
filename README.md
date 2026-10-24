@@ -71,10 +71,15 @@ example `wss://my-instance.aws-euw1.surreal.cloud`.
 
 | SSL mode | Connection |
 |---|---|
-| Disabled, Preferred (or empty) | `ws://`, no TLS |
-| Required | `wss://`, certificate not checked |
+| Disabled, Preferred | `ws://`, no TLS |
+| Required (also when the mode is empty) | `wss://`, certificate not checked |
 | Verify CA | `wss://`, certificate must chain to a trusted CA |
 | Verify Identity | `wss://`, chain and host name checked (default for `wss://` URLs) |
+
+The SSL tab shows Required until you pick a mode, and that is what the
+plugin does: a new connection to a host name uses TLS. For a local server
+without TLS (`surreal start` without `--web-crt`), set SSL mode to Disabled,
+or put a `ws://` URL in Host; with an empty mode, a URL's scheme decides.
 
 Trusted CAs are the usual public roots, or, when "CA certificate" (PEM) is
 set, only the CAs in that file: for a server with a private or self-signed
@@ -97,7 +102,9 @@ Connection strings can be imported:
 surrealdb://root:root@localhost:8000/namespace/database
 ```
 
-For TLS, set the SSL mode after importing.
+The imported connection has an empty SSL mode, which is Required (see
+above); set Disabled for a server without TLS, or Verify Identity to check
+the certificate.
 
 Plugin settings (Settings, SurrealDB plugin):
 

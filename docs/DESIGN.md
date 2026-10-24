@@ -172,14 +172,25 @@ MySQL-style modes for this dialect; the plugin maps them as follows:
 
 | SSL mode | Bare host name | Certificate check |
 |---|---|---|
-| empty, Disabled, Preferred | `ws://` | none (no TLS) |
-| Required | `wss://` | none: encrypted, any certificate accepted |
+| Disabled, Preferred | `ws://` | none (no TLS) |
+| Required, or empty | `wss://` | none: encrypted, any certificate accepted |
 | Verify CA | `wss://` | chain to a trusted root; any host name |
 | Verify Identity | `wss://` | chain and host name |
 
+An empty SSL mode is Required because that is what the host shows for it:
+`NewConnectionModal.tsx` selects `required` when `ssl_mode` is blank for a
+driver that is not PostgreSQL-dialect (this manifest says `mysql`), and
+sends no `ssl_mode` at all (`withoutBlankSslMode`). Tabularis's own MySQL
+driver does the same (`mysql_options_default_ssl_mode_is_required` in
+`pool_manager_tests.rs`). Treating empty as Disabled would show Required
+while sending credentials in clear. A plain server answering a TLS client
+hello gets a message that says so and points to Disabled.
+
 A `wss://` (or `https://`) URL in Host always uses TLS, with Verify Identity
 unless the SSL mode says otherwise; a `ws://` URL with a TLS mode is an
-error. Trusted roots are the PEM file in "CA certificate" when it is set,
+error. With an empty mode, a URL's scheme decides: `ws://` stays plain (the
+scheme is written in Host, next to the tab) and `wss://` gets Verify
+Identity, stricter than the Required the tab shows. Trusted roots are the PEM file in "CA certificate" when it is set,
 and only that file; otherwise the bundled Mozilla roots (`webpki-roots`).
 Trusting both would let anyone with a publicly valid certificate through:
 for any host name under Verify CA, which does not check the name, and for

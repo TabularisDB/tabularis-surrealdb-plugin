@@ -314,7 +314,11 @@ fn classify_connect_error(e: tokio_tungstenite::tungstenite::Error) -> ConnectEr
         WsError::Io(io)
             if {
                 let m = io.to_string().to_ascii_lowercase();
-                m.contains("certificate") || m.contains("handshake") || m.contains("tls")
+                m.contains("certificate")
+                    || m.contains("handshake")
+                    || m.contains("tls")
+                    // A plain-text answer to a TLS client hello.
+                    || m.contains("corrupt message")
             } =>
         {
             ConnectError::Tls(io.to_string())
