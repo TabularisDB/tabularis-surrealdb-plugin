@@ -40,6 +40,11 @@ Design decisions and their evidence are in [docs/DESIGN.md](docs/DESIGN.md).
   Objects and arrays open in the JSON viewer. Decimals and large integers
   keep their exact digits.
 - TLS with the connection's SSL tab, including private CA certificates.
+- Column statistics in the grid's column menu (row, NULL and distinct
+  counts, min / max, top values), computed in SurrealQL. Value statistics on
+  columns with more than 100 000 values come from a sample; see
+  [Column statistics](docs/DESIGN.md#column-statistics). Needs a Tabularis
+  version with plugin column statistics.
 - Optional query timeout (plugin settings).
 - Read-only: grid edits and schema changes are disabled. SurrealQL typed
   in the editor runs with your user's own permissions, so editor queries
@@ -132,6 +137,7 @@ Plugin settings (Settings, SurrealDB plugin):
 - `USE NS … DB …` inside a query applies to that query only; the
   connection keeps its namespace and database.
 - Generate SQL (SELECT, UPDATE, DELETE templates) produces SurrealQL.
+- Column statistics apply the tab's filter, like the grid.
 
 Values in the grid:
 
@@ -162,6 +168,11 @@ Values in the grid:
 - A transaction cannot span separate runs; keep `BEGIN … COMMIT` in one run.
 - The grid's filter bar may generate SQL operators SurrealQL does not have
   (for example `LIKE`); type the filter as SurrealQL instead.
+- Filtering by a value from the column statistics popover or a grid cell
+  quotes it as text, which SurrealQL never equals a record link, datetime,
+  duration or UUID (nor, from the popover, a boolean). Type those filters with a typed literal, for
+  example `author = person:1` or `d = d'2024-01-02T00:00:00Z'`. See
+  [Column statistics](docs/DESIGN.md#column-statistics).
 - The connection form has no field to pin the sign-in level; `auto` is used.
 
 ## Installation
@@ -229,7 +240,7 @@ src/
 ├── server.rs          stdio loop, concurrent requests, cancel
 ├── rpc.rs             method routing
 ├── models.rs          connection fields → endpoint, namespace/database, sign-in
-├── handlers/          metadata, query execution, result mapping, templates
+├── handlers/          metadata, query execution, result mapping, templates, column stats
 ├── surreal/           WebSocket RPC client, TLS, sessions, error messages
 ├── utils/             SurrealQL scanner, DEFINE parsing, value conversion
 └── bin/test_plugin.rs REPL

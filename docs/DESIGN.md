@@ -40,6 +40,7 @@ Status: **M1** = milestone 1 (PR #1), **M2** = this milestone, **deferred**
 | `session_id`, `release_session` | `session_id` accepted and ignored; `release_session` answers `-32601`, which the host tolerates. Deferred: transactions that span separate runs (SurrealDB transactions live inside one `query` call; 3.x interactive transactions need the `begin`/`commit` RPC) | — |
 | `cancel` notification | M1: local only; server-side `query_cancel` (3.3+) deferred, see Cancellation | `cancel_stops_waiting…` |
 | `get_table_query_template` (`table_query_templates`) | M1 | `browses_tables…` runs the templates |
+| `get_column_stats` (`column_stats`) | Added for Tabularis #1137 (needs a host with that change); see Column statistics | `column_statistics_…` live tests, `handlers::stats` tests |
 | `explain_query` (`explain`) | Deferred, capability off; see EXPLAIN | typed `… EXPLAIN` works as a query: `result_shapes…` |
 | Views (`views`), materialized views | Deferred / not applicable. Table views (`DEFINE TABLE … AS SELECT`) are listed as tables with a "table view" comment | — |
 | Routines (`routines`, `routine_management`) | Deferred: `DEFINE FUNCTION` could map, not in scope | — |
@@ -325,6 +326,107 @@ the protocol requires and deletes nothing.
 `sql_dialect` is `mysql`, the closest dialect the host knows: backtick
 identifiers and backslash escapes in strings, as in SurrealQL. Without it the
 host would assume PostgreSQL quoting.
+
+## Column statistics
+
+The grid's column header menu has a "Column statistics" popover: row, NULL
+and distinct counts, min / max and the 10 most frequent values, for the rows
+matching the tab's filter. Tabularis builds it with generic SQL
+(`COUNT(DISTINCT col)`, `GROUP BY col ORDER BY 2 DESC, 1 LIMIT n`) for
+SQL engines. That SQL is not SurrealQL, and since `sql_dialect` is `mysql`
+the host would otherwise treat the plugin as SQL-compatible. The manifest
+therefore declares `column_stats: true`, and the plugin answers
+`get_column_stats` (Tabularis #1137) in SurrealQL. Older hosts ignore the
+capability.
+
+The request names the table and column (unquoted), the tab's filter (a
+SurrealQL condition, as typed in the grid), a top-N limit and which parts to
+compute. The host never asks for min / max or top values of a masked column,
+and drops them anyway if they come back. The plugin sends one script in one
+`query` call, on the connection's session:
+
+```sql
+SELECT count() AS rows, count((`c` = NONE) OR (`c` = NULL)) AS nulls
+  FROM `t` WHERE (<filter>) GROUP ALL;
+LET $values = (SELECT `c` AS v FROM `t`
+  WHERE (<filter>) AND `c` != NONE AND `c` != NULL LIMIT 100000);
+RETURN { sampled: array::len($values),
+         distinct: array::len(array::distinct($values.v)),
+         min: array::min($values.v), max: array::max($values.v) };
+SELECT * FROM (SELECT v, count() AS count FROM $values GROUP BY v)
+  ORDER BY count DESC, v ASC LIMIT 10;
+```
+
+Only the parts the host asked for are added. Choices:
+
+- **NULL.** A missing field is NONE. Both NONE and NULL count as NULL, the
+  way the grid shows both as an empty cell.
+- **Counts are exact.** `count()` with `GROUP ALL` reads every matching
+  record, the same work as counting the filtered rows of the grid.
+- **Value statistics are sampled on big tables.** Distinct count, min / max
+  and top values are computed from the first 100 000 non-NULL values in the
+  table's natural (record id) order, kept in `$values` on the server. When
+  the column has more non-NULL values than that, the result carries
+  `sample_size: 100000` and the popover says the values come from a sample.
+  The first records are not a random sample; a random one
+  (`ORDER BY rand()`) would have to read and sort the whole table, which is
+  what the cap avoids. Grouping runs over `$values`, so the table is read
+  twice at most (once for the counts, once for the sample).
+- **Min / max.** `array::min` / `array::max` compare with SurrealDB's own
+  ordering, so they work for numbers, datetimes, strings and durations
+  alike (`math::min` only takes numbers). The host asks for them only for
+  numeric and date/time columns.
+- **Top values.** `GROUP BY v` over the sample, sorted by count in an
+  outer SELECT, ties broken by value. The sort cannot go in the grouping
+  SELECT: 2.x ignores `ORDER BY count` there and returns the groups ordered
+  by `v`, and the `LIMIT` then keeps the wrong values. Values
+  are converted like grid cells (record ids as `table:id`, datetimes as
+  text).
+- **Filtering by a top value.** Clicking a value filters by
+  `column = value`. The host turns every top value into text
+  (`parseDistinctValues`) and quotes it unless the column is numeric
+  (`formatSqlValueForFilter`), so the filter compares the column with a
+  string. SurrealQL compares strictly (`person:1 = 'person:1'`,
+  `d'2024-01-02T00:00:00Z' = '2024-01-02T00:00:00Z'` and `true = 'true'`
+  are all false on 2.x and 3.x), so for record links, datetimes, durations,
+  UUIDs and booleans that filter matches nothing. Strings and numbers work.
+  The grid's "filter by cell value" builds the same clause from the cell,
+  whose record links, datetimes, durations and UUIDs are already text, so it
+  has the same gap except for booleans. No value the plugin returns can avoid the quoting; fixing it needs
+  either the host to take a ready-made literal from the plugin, or the
+  plugin to cast string literals compared with typed columns in the grid
+  query. Until then it is listed under Limitations in the README.
+- **Filter.** The filter is inserted as `(<filter>\n)`: the newline keeps a
+  trailing `--` comment from swallowing the bracket. It must have the shape
+  of one condition (brackets, quotes and regex literals balance, no
+  top-level `;`), or it is refused with `-32602`: spliced in as is, it
+  would change the shape of the script around it and fail with a confusing
+  parse error, or report statistics for something else. This is a shape
+  check, not a security guard. One expression can still write
+  (`(DELETE t) = []`, `{ DELETE t; true }`), just as the same filter can in
+  the grid, which runs it as typed, and the editor runs anything; all of it
+  runs with the signed-in user's permissions.
+- **Empty results.** 2.x returns no row for a `GROUP ALL` over nothing, 3.x
+  a zero row; both read as 0. That row is the only result allowed to be
+  missing, and min / max the only values allowed to be NONE (an empty
+  sample). A missing or mistyped `sampled`, `distinct` or top-values result
+  is an error naming what was expected, not a zero or an empty list, so a
+  server that shapes a result differently cannot show wrong statistics.
+- **Timeout.** With the query timeout setting on, every SELECT of the
+  script (the counts, the sample inside `LET`, the top values) ends in
+  `TIMEOUT <n>s`, so the server stops it and answers with its timeout
+  error. The popover never cancels a request, so a timeout that only
+  stopped the plugin from waiting would leave a full `count() … GROUP ALL`
+  running on a big table. The plugin waits at most `<n>` seconds per
+  statement plus one, which only matters for a server that does not answer.
+  `RETURN` takes no `TIMEOUT`; it works on the sample in `$values`, at most
+  100 000 values.
+
+Verified live on 2.7.0, 3.2.3 and 3.2.6
+(`column_statistics_respect_the_filter_and_the_requested_parts`,
+`column_statistics_sample_large_tables_and_keep_exact_counts` with over 100 000
+rows, and the statistics part of `query_timeout_is_enforced_with_actionable_errors`).
+CI runs the same live tests on v2 and v3.
 
 ## Result mapping
 

@@ -45,6 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TIMEOUT`, every query is bounded locally, with actionable errors.
 - Affected rows for CREATE, INSERT, UPDATE, UPSERT, DELETE and RELATE, and
   the server's statement time on results.
+- `get_column_stats` (manifest `column_stats`) for the grid's column
+  statistics popover: exact row and NULL counts, and distinct count,
+  min / max and top values from the first 100 000 non-NULL values, all with
+  the tab's filter. Needs the Tabularis host change for #1137.
 
 ### Changed
 
