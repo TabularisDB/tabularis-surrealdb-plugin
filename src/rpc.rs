@@ -3,7 +3,7 @@
 use serde_json::{json, Value};
 
 use crate::error::PluginError;
-use crate::handlers::{metadata, query, templates, Context};
+use crate::handlers::{metadata, query, templates, Context, Settings};
 
 const READ_ONLY: &str = "the SurrealDB plugin is read-only in this release";
 const NO_DDL: &str = "schema changes are not supported by the SurrealDB plugin yet";
@@ -11,9 +11,11 @@ const NO_DDL: &str = "schema changes are not supported by the SurrealDB plugin y
 /// Run one method and return its result or error.
 pub async fn dispatch(ctx: &Context, method: &str, params: &Value) -> Result<Value, PluginError> {
     match method {
-        // Settings are not used; acknowledge so the host does not log a
-        // failure.
-        "initialize" => Ok(Value::Null),
+        "initialize" => {
+            let settings = Settings::from_initialize(params);
+            *ctx.settings.write().unwrap_or_else(|e| e.into_inner()) = settings;
+            Ok(Value::Null)
+        }
         "ping" => query::ping(ctx, params).await,
         "test_connection" => query::test_connection(ctx, params).await,
 
@@ -26,12 +28,12 @@ pub async fn dispatch(ctx: &Context, method: &str, params: &Value) -> Result<Val
         "get_indexes" => metadata::get_indexes(ctx, params).await,
         "get_all_columns_batch" => metadata::get_all_columns_batch(ctx, params).await,
         "get_all_foreign_keys_batch" => metadata::get_all_foreign_keys_batch(ctx, params).await,
-        // Record links and relations are not reported as foreign keys yet.
-        "get_foreign_keys" => Ok(json!([])),
+        "get_foreign_keys" => metadata::get_foreign_keys(ctx, params).await,
         // `capabilities.views` and `routines` are false.
         "get_views" | "get_routines" => Ok(json!([])),
 
         "execute_query" => query::execute_query(ctx, params).await,
+        "execute_query_batch" => query::execute_query_batch(ctx, params).await,
         "get_table_query_template" => templates::get_table_query_template(params),
 
         "insert_record" | "update_record" | "delete_record" | "save_blob_to_file" => {
@@ -49,8 +51,7 @@ pub async fn dispatch(ctx: &Context, method: &str, params: &Value) -> Result<Val
         | "drop_view" => Err(PluginError::unsupported(method, NO_DDL)),
 
         // Everything else, including get_schema_snapshot (the host composes
-        // it from get_tables/get_columns) and execute_query_batch (the host
-        // falls back to execute_query per statement).
+        // it from get_tables/get_columns/get_foreign_keys).
         other => Err(PluginError::method_not_found(other)),
     }
 }
@@ -101,12 +102,7 @@ mod tests {
 
     #[test]
     fn unknown_methods_are_method_not_found() {
-        for method in [
-            "get_schema_snapshot",
-            "execute_query_batch",
-            "explain_query",
-            "nope",
-        ] {
+        for method in ["get_schema_snapshot", "explain_query", "nope"] {
             let e = run(method, json!({})).unwrap_err();
             assert_eq!(e.code, METHOD_NOT_FOUND);
             assert_eq!(e.message, format!("Method not found: {method}"));
@@ -119,8 +115,18 @@ mod tests {
             run("initialize", json!({ "settings": {} })).unwrap(),
             Value::Null
         );
+        let ctx = Context::default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(dispatch(
+            &ctx,
+            "initialize",
+            &json!({ "settings": { "query_timeout_seconds": 12 } }),
+        ))
+        .unwrap();
+        assert_eq!(ctx.settings().query_timeout_secs, Some(12));
         assert_eq!(run("get_schemas", json!({})).unwrap(), json!([]));
-        assert_eq!(run("get_foreign_keys", json!({})).unwrap(), json!([]));
         assert_eq!(
             run(
                 "get_table_query_template",

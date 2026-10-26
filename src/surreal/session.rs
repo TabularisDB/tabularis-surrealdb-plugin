@@ -22,25 +22,61 @@ pub enum StatementOutcome {
     Err(String),
 }
 
+/// A statement outcome with the server-side execution time it reported.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimedOutcome {
+    pub outcome: StatementOutcome,
+    pub time_ms: Option<f64>,
+}
+
+impl TimedOutcome {
+    pub fn ok(value: Cbor) -> Self {
+        Self {
+            outcome: StatementOutcome::Ok(value),
+            time_ms: None,
+        }
+    }
+
+    pub fn err(message: impl Into<String>) -> Self {
+        Self {
+            outcome: StatementOutcome::Err(message.into()),
+            time_ms: None,
+        }
+    }
+}
+
 pub struct Session {
     client: RpcClient,
     pub config: SessionConfig,
     pub signed_in_as: AuthLevel,
+    /// Major version of the server (`2`, `3`), read once when the session
+    /// opens. `None` when the server did not say.
+    pub server_major: Option<u64>,
 }
 
 impl Session {
     /// Connect, sign in, check that the namespace/database exists and
     /// select it.
     pub async fn open(config: &SessionConfig) -> Result<Self, PluginError> {
-        let client = RpcClient::connect(&config.url, CONNECT_TIMEOUT)
+        let client = RpcClient::connect(&config.url, CONNECT_TIMEOUT, &config.tls)
             .await
             .map_err(|e| errors::connect_error(&config.url, &e))?;
         let signed_in_as = bounded("signing in", sign_in(&client, config)).await??;
-        let session = Self {
+        let mut session = Self {
             client,
             config: config.clone(),
             signed_in_as,
+            server_major: None,
         };
+        // Best effort: statement results are shaped slightly differently on
+        // 2.x (see `handlers::query::Answers`), but a server that does not
+        // answer `version` can still be used.
+        session.server_major = bounded("reading the server version", session.version())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .as_deref()
+            .and_then(major_version);
         if config.namespace.is_some() {
             let target = config.target();
             bounded(
@@ -111,7 +147,7 @@ impl Session {
     /// key, so the caller cannot tell either way.
     async fn info_names(&self, sql: &str, key: &str) -> Result<Option<Vec<String>>, PluginError> {
         let info = match self.query(sql, vec![]).await {
-            Ok(outcomes) => match outcomes.into_iter().next() {
+            Ok(outcomes) => match outcomes.into_iter().next().map(|timed| timed.outcome) {
                 Some(StatementOutcome::Ok(info)) => info,
                 Some(StatementOutcome::Err(m)) if errors::is_permission_denied(&m) => {
                     return Ok(None)
@@ -163,7 +199,7 @@ impl Session {
         &self,
         sql: &str,
         vars: Vec<(&str, Cbor)>,
-    ) -> Result<Vec<StatementOutcome>, RpcError> {
+    ) -> Result<Vec<TimedOutcome>, RpcError> {
         let vars = Cbor::Map(
             vars.into_iter()
                 .map(|(k, v)| (Cbor::Text(k.to_string()), v))
@@ -181,7 +217,7 @@ impl Session {
         &self,
         sql: &str,
         vars: Vec<(&str, Cbor)>,
-    ) -> Result<Vec<StatementOutcome>, PluginError> {
+    ) -> Result<Vec<TimedOutcome>, PluginError> {
         self.query(sql, vars).await.map_err(|e| self.rpc_error(e))
     }
 
@@ -195,7 +231,7 @@ impl Session {
         self.query_checked(sql, vars)
             .await?
             .into_iter()
-            .map(|outcome| match outcome {
+            .map(|timed| match timed.outcome {
                 StatementOutcome::Ok(v) => Ok(v),
                 StatementOutcome::Err(m) => Err(PluginError::internal(self.hint(&m))),
             })
@@ -327,7 +363,7 @@ pub fn signin_params(config: &SessionConfig, level: AuthLevel) -> Cbor {
 /// Read the `query` response: an array of `{ status, time, result }`.
 /// For `status: "ERR"` the result is the error message (2.x) or carries it
 /// next to `kind`/`details` (3.x).
-pub fn parse_query_response(response: Cbor) -> Result<Vec<StatementOutcome>, RpcError> {
+pub fn parse_query_response(response: Cbor) -> Result<Vec<TimedOutcome>, RpcError> {
     let Cbor::Array(items) = response else {
         return Err(RpcError::Protocol(
             "query did not return an array".to_string(),
@@ -337,14 +373,16 @@ pub fn parse_query_response(response: Cbor) -> Result<Vec<StatementOutcome>, Rpc
         .into_iter()
         .map(|item| {
             let Cbor::Map(entries) = item else {
-                return StatementOutcome::Ok(item);
+                return TimedOutcome::ok(item);
             };
             let mut status = None;
+            let mut time_ms = None;
             let mut result = Cbor::Tag(crate::utils::values::tags::NONE, Box::new(Cbor::Null));
             for (k, v) in entries {
                 match k.as_text() {
                     Some("status") => status = v.as_text().map(str::to_string),
                     Some("result") => result = v,
+                    Some("time") => time_ms = v.as_text().and_then(parse_duration_ms),
                     _ => {}
                 }
             }
@@ -353,12 +391,46 @@ pub fn parse_query_response(response: Cbor) -> Result<Vec<StatementOutcome>, Rpc
                     Cbor::Text(t) => t,
                     other => crate::utils::values::to_cell(&other).to_string(),
                 };
-                StatementOutcome::Err(message)
+                TimedOutcome {
+                    outcome: StatementOutcome::Err(message),
+                    time_ms,
+                }
             } else {
-                StatementOutcome::Ok(result)
+                TimedOutcome {
+                    outcome: StatementOutcome::Ok(result),
+                    time_ms,
+                }
             }
         })
         .collect())
+}
+
+/// Milliseconds from a statement `time` such as `3.82ms`, `130.3µs`,
+/// `1.5s` or `10ns` (Rust's `Duration` debug format, used by 2.x and 3.x).
+pub fn parse_duration_ms(text: &str) -> Option<f64> {
+    let text = text.trim();
+    let split = text.find(|c: char| !(c.is_ascii_digit() || c == '.'))?;
+    let (number, unit) = text.split_at(split);
+    let value: f64 = number.parse().ok()?;
+    let factor = match unit {
+        "ns" => 1e-6,
+        "µs" | "us" => 1e-3,
+        "ms" => 1.0,
+        "s" => 1e3,
+        _ => return None,
+    };
+    Some(value * factor)
+}
+
+/// Major version from a version text such as `surrealdb-2.7.0` or
+/// `surrealdb-3.2.6+20261018.c63e805`.
+pub fn major_version(text: &str) -> Option<u64> {
+    let rest = text
+        .trim()
+        .strip_prefix("surrealdb-")
+        .unwrap_or(text.trim());
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 fn version_text(value: &Cbor) -> String {
@@ -395,6 +467,7 @@ mod tests {
             username: Some("u".into()),
             password: Some("p".into()),
             auth: AuthLevel::Auto,
+            tls: Default::default(),
             connection_id: None,
         }
     }
@@ -439,12 +512,18 @@ mod tests {
             map(vec![("status", Cbor::Text("OK".into()))]),
         ]);
         let out = parse_query_response(response).unwrap();
-        assert_eq!(out[0], StatementOutcome::Ok(Cbor::Integer(1.into())));
         assert_eq!(
-            out[1],
+            out[0].outcome,
+            StatementOutcome::Ok(Cbor::Integer(1.into()))
+        );
+        assert_eq!(
+            out[1].outcome,
             StatementOutcome::Err("The table 'nosuch' does not exist".into())
         );
-        assert!(matches!(&out[2], StatementOutcome::Ok(Cbor::Tag(6, _))));
+        assert!(matches!(
+            &out[2].outcome,
+            StatementOutcome::Ok(Cbor::Tag(6, _))
+        ));
         assert!(parse_query_response(Cbor::Null).is_err());
     }
 
@@ -471,6 +550,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_statement_times() {
+        let close = |a: Option<f64>, b: f64| (a.unwrap() - b).abs() < 1e-9;
+        assert!(close(parse_duration_ms("3.822666ms"), 3.822666));
+        assert!(close(parse_duration_ms("130.333µs"), 0.130333));
+        assert!(close(parse_duration_ms("1.5s"), 1500.0));
+        assert!(close(parse_duration_ms("10ns"), 0.00001));
+        assert_eq!(parse_duration_ms("soon"), None);
+        assert_eq!(parse_duration_ms("1h"), None);
+        let response = Cbor::Array(vec![map(vec![
+            ("status", Cbor::Text("OK".into())),
+            ("time", Cbor::Text("2ms".into())),
+            ("result", Cbor::Null),
+        ])]);
+        assert_eq!(
+            parse_query_response(response).unwrap()[0].time_ms,
+            Some(2.0)
+        );
+    }
+
+    #[test]
     fn version_text_from_2x_and_3x() {
         assert_eq!(
             version_text(&Cbor::Text("surrealdb-2.3.7".into())),
@@ -480,5 +579,13 @@ mod tests {
             version_text(&map(vec![("version", Cbor::Text("3.2.3".into()))])),
             "surrealdb-3.2.3"
         );
+    }
+
+    #[test]
+    fn major_version_from_version_text() {
+        assert_eq!(major_version("surrealdb-2.7.0"), Some(2));
+        assert_eq!(major_version("surrealdb-3.2.6+20261018.c63e805"), Some(3));
+        assert_eq!(major_version("3.0.0"), Some(3));
+        assert_eq!(major_version("surrealdb-beta"), None);
     }
 }

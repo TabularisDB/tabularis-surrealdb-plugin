@@ -30,10 +30,17 @@ Design decisions and their evidence are in [docs/DESIGN.md](docs/DESIGN.md).
 - Open tables in the grid with paging; filter and sort text typed in the
   grid is passed through as SurrealQL.
 - Run any SurrealQL, including graph traversals and multi-statement scripts.
-  Each statement gets its own result tab.
+  "Run all" in the editor sends the script as one SurrealQL query, so `LET`
+  variables and transactions work across statements, and each statement
+  gets its own result tab or error.
+- Record links (`record<table>` fields, relation `in`/`out`) appear as
+  foreign keys: the ER diagram shows them and the grid can open the linked
+  record.
 - Record ids are shown as `table:id` text you can paste back into a query.
   Objects and arrays open in the JSON viewer. Decimals and large integers
   keep their exact digits.
+- TLS with the connection's SSL tab, including private CA certificates.
+- Optional query timeout (plugin settings).
 - Read-only: grid edits and schema changes are disabled. SurrealQL typed
   in the editor runs with your user's own permissions, so editor queries
   can still write.
@@ -42,8 +49,8 @@ Design decisions and their evidence are in [docs/DESIGN.md](docs/DESIGN.md).
 
 | Version | Status |
 |---|---|
-| 3.x | Supported. Tested against 3.2.3 locally, and against `surrealdb/surrealdb:v3` in CI. |
-| 2.x | Supported. CI runs the live test against `surrealdb/surrealdb:v2`. |
+| 3.x | Supported. Tested against 3.2.3 and 3.2.6 locally, and against `surrealdb/surrealdb:v3` in CI. |
+| 2.x | Supported. Tested against 2.7.0 locally, and against `surrealdb/surrealdb:v2` in CI. |
 | 1.x | Not supported. |
 
 The plugin connects over SurrealDB's WebSocket RPC protocol (`/rpc`) with
@@ -59,8 +66,26 @@ CBOR encoding. See [docs/DESIGN.md](docs/DESIGN.md#supported-surrealdb-versions)
 | Username | A SurrealDB system user (root, namespace or database level) |
 | Password | That user's password. To sign in with a token, leave Username empty and paste the JWT here. |
 
-Use `wss://` (or `https://`) in Host for servers behind TLS, for example
-`wss://my-instance.aws-euw1.surreal.cloud`.
+TLS: use the SSL tab, or put a `wss://` (or `https://`) URL in Host, for
+example `wss://my-instance.aws-euw1.surreal.cloud`.
+
+| SSL mode | Connection |
+|---|---|
+| Disabled, Preferred | `ws://`, no TLS |
+| Required (also when the mode is empty) | `wss://`, certificate not checked |
+| Verify CA | `wss://`, certificate must chain to a trusted CA |
+| Verify Identity | `wss://`, chain and host name checked (default for `wss://` URLs) |
+
+The SSL tab shows Required until you pick a mode, and that is what the
+plugin does: a new connection to a host name uses TLS. For a local server
+without TLS (`surreal start` without `--web-crt`), set SSL mode to Disabled,
+or put a `ws://` URL in Host; with an empty mode, a URL's scheme decides.
+
+Trusted CAs are the usual public roots, or, when "CA certificate" (PEM) is
+set, only the CAs in that file: for a server with a private or self-signed
+CA, a certificate from any other CA is refused (as with PostgreSQL's
+`sslrootcert`). Required checks no certificate, so it ignores the file. Client certificates are
+not used by SurrealDB and are rejected.
 
 The namespace and database must exist. The plugin checks this before
 selecting them and reports a missing one, instead of letting SurrealDB 3.x
@@ -77,7 +102,15 @@ Connection strings can be imported:
 surrealdb://root:root@localhost:8000/namespace/database
 ```
 
-For TLS, edit Host to a `wss://` URL after importing.
+The imported connection has an empty SSL mode, which is Required (see
+above); set Disabled for a server without TLS, or Verify Identity to check
+the certificate.
+
+Plugin settings (Settings, SurrealDB plugin):
+
+| Setting | Effect |
+|---|---|
+| Query timeout (seconds) | Stop waiting for a query after this long and say so. Table-grid SELECTs also get a SurrealQL `TIMEOUT`, so the server fails them at that point. 0 or empty: off (the Tabularis call timeout still applies). |
 
 ## Browsing and querying
 
@@ -87,6 +120,15 @@ For TLS, edit Host to a `wss://` URL after importing.
   rows with the union of their fields (`id` first, missing fields empty); a
   single object becomes one row; scalars and mixed arrays use a single
   `result` column.
+- In a script, statements that never return data (`USE`, `LET`, `DEFINE`,
+  `REMOVE`, `BEGIN`, `COMMIT`, …) produce no result tab, so a notebook cell
+  shows the first real result. This goes by statement, so the result is the
+  same on SurrealDB 2.x and 3.x.
+- Writes (CREATE, UPDATE, …) report the records they returned as affected
+  rows.
+- The query Tabularis builds to follow a record link
+  (`WHERE id = 'person:alice'`) is cast to a record id, so it finds the
+  linked record.
 - `USE NS … DB …` inside a query applies to that query only; the
   connection keeps its namespace and database.
 - Generate SQL (SELECT, UPDATE, DELETE templates) produces SurrealQL.
@@ -114,9 +156,10 @@ Values in the grid:
 - Fields of SCHEMALESS tables that appear only after the first 100 records
   are not listed in the column inspector; they still appear in query
   results.
-- Record links are not shown as foreign keys yet.
-- TLS uses the bundled Mozilla root certificates. Custom CA certificates
-  and client certificates are not supported yet.
+- Visual EXPLAIN is off (SurrealDB's plan format differs between versions
+  and is documented as subject to change); typing `EXPLAIN` in the editor
+  works. See [EXPLAIN](docs/DESIGN.md#explain).
+- A transaction cannot span separate runs; keep `BEGIN … COMMIT` in one run.
 - The grid's filter bar may generate SQL operators SurrealQL does not have
   (for example `LIKE`); type the filter as SurrealQL instead.
 - The connection form has no field to pin the sign-in level; `auto` is used.
@@ -154,6 +197,13 @@ just surreal        # terminal 1: in-memory SurrealDB on 127.0.0.1:8000
 just live-test      # terminal 2
 ```
 
+TLS test (needs the `surreal` and `openssl` CLIs; it creates a private CA,
+starts its own TLS server on a free port and stops it):
+
+```bash
+just tls-test
+```
+
 With Docker instead of the CLI, for example to check 2.x:
 
 ```bash
@@ -180,10 +230,11 @@ src/
 ├── rpc.rs             method routing
 ├── models.rs          connection fields → endpoint, namespace/database, sign-in
 ├── handlers/          metadata, query execution, result mapping, templates
-├── surreal/           WebSocket RPC client, sessions, error messages
+├── surreal/           WebSocket RPC client, TLS, sessions, error messages
 ├── utils/             SurrealQL scanner, DEFINE parsing, value conversion
 └── bin/test_plugin.rs REPL
 tests/live_db.rs       live integration test
+tests/live_tls.rs      live TLS test (private CA, SSL modes)
 fixture/seed.surql     test data
 ```
 

@@ -442,6 +442,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite",
+ "webpki-roots 1.0.10",
 ]
 
 [[package]]
