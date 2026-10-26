@@ -4,7 +4,8 @@ SurrealDB driver plugin for [Tabularis](https://tabularis.dev): select a
 namespace and database, browse tables, fields and indexes, inspect records,
 and run native SurrealQL from the editor and SQL notebooks.
 
-Work in progress, not released yet. Scope and progress:
+Requires Tabularis 0.26.0 or later; see [Installation](#installation).
+Scope and progress:
 [TabularisDB/tabularis#1019](https://github.com/TabularisDB/tabularis/issues/1019).
 Design decisions and their evidence are in [docs/DESIGN.md](docs/DESIGN.md).
 
@@ -43,8 +44,8 @@ Design decisions and their evidence are in [docs/DESIGN.md](docs/DESIGN.md).
 - Column statistics in the grid's column menu (row, NULL and distinct
   counts, min / max, top values), computed in SurrealQL. Value statistics on
   columns with more than 100 000 values come from a sample; see
-  [Column statistics](docs/DESIGN.md#column-statistics). Needs a Tabularis
-  version with plugin column statistics.
+  [Column statistics](docs/DESIGN.md#column-statistics). Needs Tabularis
+  0.29.0 or later.
 - Optional query timeout (plugin settings).
 - Read-only: grid edits and schema changes are disabled. SurrealQL typed
   in the editor runs with your user's own permissions, so editor queries
@@ -177,16 +178,70 @@ Values in the grid:
 
 ## Installation
 
-Not yet published to the registry. To try a development build, see
-[Development](#development).
+Requires Tabularis 0.26.0 or later. Column statistics need 0.29.0.
 
-Manual install of a release archive, once releases exist: unzip
-`surrealdb-plugin-<platform>.zip` into the Tabularis plugins folder as
-`plugins/drivers/surrealdb/` and restart Tabularis:
+### From the plugin registry
 
-- Linux: `~/.local/share/tabularis/plugins/drivers/surrealdb/`
-- macOS: `~/Library/Application Support/tabularis/plugins/drivers/surrealdb/`
-- Windows: `%APPDATA%\tabularis\plugins\drivers\surrealdb\`
+In Tabularis, open **Settings → Plugins**, search for **SurrealDB** and
+install it. You can also pick SurrealDB in the new-connection catalogue and
+install it from there, or open `tabularis://install/surrealdb`. Tabularis
+downloads the archive for your platform, checks it against the registry's
+signed SHA-256, and loads the driver without a restart. Updates show up in
+the same place.
+
+The plugin is listed once its first release has been submitted to the
+[Tabularium registry](https://registry.tabularis.dev). Until then, install
+it manually.
+
+### Manual install from a release archive
+
+Every [GitHub release](https://github.com/TabularisDB/tabularis-surrealdb-plugin/releases)
+has one archive per platform:
+
+| Platform | Archive |
+|---|---|
+| Linux x86-64 | `surrealdb-plugin-linux-x64.zip` |
+| Linux ARM64 | `surrealdb-plugin-linux-arm64.zip` |
+| macOS, Apple Silicon | `surrealdb-plugin-darwin-arm64.zip` |
+| macOS, Intel | `surrealdb-plugin-darwin-x64.zip` |
+| Windows x86-64 | `surrealdb-plugin-win-x64.zip` |
+
+An archive holds the executable (`surrealdb-plugin`, or
+`surrealdb-plugin.exe` on Windows) and the `.tabularium` manifest, with no
+folder around them. Extract it into this folder, creating it if needed:
+
+| OS | Folder |
+|---|---|
+| Linux | `~/.local/share/tabularis/plugins/drivers/surrealdb/` |
+| macOS | `~/Library/Application Support/tabularis/plugins/drivers/surrealdb/` |
+| Windows | `%APPDATA%\tabularis\plugins\drivers\surrealdb\` |
+
+Linux (on macOS, use the macOS folder and archive name):
+
+```bash
+dir="$HOME/.local/share/tabularis/plugins/drivers/surrealdb"
+mkdir -p "$dir"
+unzip -o surrealdb-plugin-linux-x64.zip -d "$dir"
+```
+
+Windows (PowerShell):
+
+```powershell
+$dir = Join-Path $env:APPDATA "tabularis\plugins\drivers\surrealdb"
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+Expand-Archive surrealdb-plugin-win-x64.zip -DestinationPath $dir -Force
+```
+
+Then restart Tabularis. SurrealDB appears in the new-connection catalogue.
+
+- `unzip` keeps the executable bit. If you extract the archive another way
+  on Linux or macOS, run `chmod +x surrealdb-plugin` in that folder.
+- On macOS, a browser marks downloaded files as quarantined. If macOS
+  refuses to run the plugin after a manual install, clear the flag:
+  `xattr -dr com.apple.quarantine "$HOME/Library/Application Support/tabularis/plugins/drivers/surrealdb"`.
+- To update, quit Tabularis, extract the new archive over the old files
+  and start it again. To uninstall, remove the plugin in Settings or delete
+  the folder.
 
 ## Development
 
@@ -231,6 +286,9 @@ cargo build && just repl
 > columns person
 > SELECT ->knows->person.name AS friends FROM person:alice
 ```
+
+Releases are cut by pushing a tag; the steps, including the registry
+submission, are in [docs/RELEASING.md](docs/RELEASING.md).
 
 Layout:
 
