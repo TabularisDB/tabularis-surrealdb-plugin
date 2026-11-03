@@ -97,8 +97,10 @@ Other factors:
 
 ## Supported SurrealDB versions
 
-- **3.x**: tested. The live test passes against 3.2.3 locally and against
-  the `surrealdb/surrealdb:v3` image in CI.
+- **3.x**: tested. The live test passes against 3.2.3, 3.2.6 and 3.3.5 locally
+  and against the `surrealdb/surrealdb:v3` image in CI. On 3.3 and later a
+  database user may not select its namespace alone, so the check that the
+  database exists is skipped for it, as `INFO FOR NS` already was.
 - **2.x**: tested. The CI job `live-db-integration` runs the same live test
   against the `surrealdb/surrealdb:v2` image, and it passes. To run it
   locally without installing another version:

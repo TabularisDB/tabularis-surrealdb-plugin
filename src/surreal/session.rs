@@ -125,10 +125,22 @@ impl Session {
         let Some(db) = &self.config.database else {
             return Ok(());
         };
-        self.client
+        match self
+            .client
             .call("use", vec![Cbor::Text(ns.clone()), Cbor::Null])
             .await
-            .map_err(|e| self.rpc_error(e))?;
+        {
+            Ok(_) => {}
+            // 3.3+ refuses to let a database user leave its database, and
+            // keeps the session where it was.
+            Err(RpcError::Server(e))
+                if e.kind.as_deref() == Some("NotAllowed")
+                    || errors::is_permission_denied(&e.message) =>
+            {
+                return Ok(())
+            }
+            Err(e) => return Err(self.rpc_error(e)),
+        }
         if let Some(names) = self.info_names("INFO FOR NS", "databases").await? {
             if !names.contains(db) {
                 return Err(errors::not_found(

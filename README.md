@@ -55,7 +55,7 @@ Design decisions and their evidence are in [docs/DESIGN.md](docs/DESIGN.md).
 
 | Version | Status |
 |---|---|
-| 3.x | Supported. Tested against 3.2.3 and 3.2.6 locally, and against `surrealdb/surrealdb:v3` in CI. |
+| 3.x | Supported. Tested against 3.2.3, 3.2.6 and 3.3.5 locally, and against `surrealdb/surrealdb:v3` in CI. |
 | 2.x | Supported. Tested against 2.7.0 locally, and against `surrealdb/surrealdb:v2` in CI. |
 | 1.x | Not supported. |
 
