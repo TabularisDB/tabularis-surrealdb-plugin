@@ -465,6 +465,18 @@ CI runs the same live tests on v2 and v3.
 | scalar or NULL | one `result` column, one row |
 | NONE (`LET`, `DEFINE`, …) | no columns, no rows |
 
+Table browses (the query the host builds for a table tab, see "Table
+browsing and query templates") also get the table's declared top-level
+fields: `id`, then the declared fields in server order, then any other
+field in first-seen order, the order `get_columns` uses. A NONE field is
+absent from its record, so a page whose records all lack a field (on the
+seed's `person`, `name = 'Bob'`, or following `best_friend` to `person:bob`,
+who has no `age` or `best_friend`) used to lose that column. The plugin
+reads `INFO FOR TABLE` together with the query, on the same WebSocket; if
+that fails, the columns come from the records as before. The host quotes
+the table with backticks, which tells a table tab from the same SELECT
+typed in the editor; free SurrealQL keeps the columns of its result.
+
 Scripts in one `execute_query` call (notebook cells, a single editor
 statement the host did not split): statements that never return data
 produce no result set. They are recognised by their first keyword, not by a

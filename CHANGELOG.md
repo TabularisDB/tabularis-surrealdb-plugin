@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keep it selected under Choose databases, and the README's Connecting
   section describes the Databases tab and the connection string. No message
   refers to a Database field any more.
+- A filtered table tab, or a record link followed to its record, showed
+  only the fields the returned records had: `person` filtered to Bob, who
+  has no `age` or `best_friend`, lost those two columns. Table tabs now show
+  `id` and every declared field of the table, in declared order, then any
+  other field of the records, whichever records come back. Queries typed in
+  the editor keep the columns of their result.
 
 ## [0.1.0] - 2026-11-03
 
