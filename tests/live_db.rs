@@ -853,6 +853,111 @@ fn record_links_are_foreign_keys_and_navigable() {
 }
 
 #[test]
+fn filtering_by_a_record_link_value_finds_its_records() {
+    let e = live!();
+    let mut p = Plugin::start();
+    let conn = connection(&e, &main_db(&e), "link-filter");
+    let browse = |p: &mut Plugin, sql: &str| {
+        p.ok(
+            "execute_query",
+            json!({ "params": conn, "query": sql, "limit": 50, "page": 1 }),
+        )
+    };
+    let ids = |r: &Value| -> Vec<String> {
+        (0..r["rows"].as_array().unwrap().len())
+            .map(|i| cell(r, i, "id").as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // Clicking `person:bob` among the top values of `best_friend`: the host
+    // makes it the tab's filter, quoted as text.
+    let top = column_stats(
+        &mut p,
+        &conn,
+        "person",
+        "best_friend",
+        Value::Null,
+        json!({ "top_values": true }),
+    )
+    .unwrap();
+    assert_eq!(
+        top["top_values"],
+        json!([{ "value": "person:bob", "count": 1 }])
+    );
+    let filter = "`best_friend` = 'person:bob'";
+    let r = browse(&mut p, &format!("SELECT * FROM `person` WHERE {filter}"));
+    assert_eq!(ids(&r), ["person:alice"]);
+    // The statistics of the filtered tab count the same record.
+    let stats = column_stats(
+        &mut p,
+        &conn,
+        "person",
+        "best_friend",
+        json!(filter),
+        json!({ "distinct": true }),
+    )
+    .unwrap();
+    assert_eq!(
+        (stats["row_count"].clone(), stats["distinct_count"].clone()),
+        (json!(1), json!(1))
+    );
+
+    // Added to the tab's own filter, with its sort, and inside the host's
+    // LIMIT wrapper.
+    for sql in [
+        "SELECT * FROM `person` WHERE (age > 1) AND `best_friend` = 'person:bob' ORDER BY name",
+        "SELECT * FROM (SELECT * FROM `person` WHERE `best_friend` = 'person:bob' LIMIT 5) AS limited_subset",
+    ] {
+        assert_eq!(ids(&browse(&mut p, sql)), ["person:alice"], "{sql}");
+    }
+
+    // `option<record<person>>` on a SCHEMALESS table, a record id with an
+    // array key (the grid's cell menu on `id`), and a relation's `in`.
+    let r = browse(
+        &mut p,
+        "SELECT * FROM `event` WHERE `actor` = 'person:alice'",
+    );
+    assert_eq!(ids(&r), ["event:1"]);
+    let r = browse(
+        &mut p,
+        "SELECT * FROM `event` WHERE (kind != 'x') AND `id` = 'event:[2024, ''q1'']'",
+    );
+    assert_eq!(ids(&r), ["event:[2024, 'q1']"]);
+    let r = browse(&mut p, "SELECT * FROM `knows` WHERE `in` = 'person:alice'");
+    assert_eq!(r["rows"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(cell(&r, 0, "out"), "person:bob");
+
+    // Text that is not a record id of the linked table stays text: no
+    // error, and no record (3.x would cast 'person:bob extra' to person:bob).
+    for sql in [
+        "SELECT * FROM `person` WHERE `best_friend` = 'person:bob extra'",
+        "SELECT * FROM `person` WHERE `best_friend` = 'event:1'",
+        "SELECT * FROM `person` WHERE `best_friend` = 'Bob'",
+        "SELECT * FROM `person` WHERE `name` = 'person:bob'",
+    ] {
+        assert_eq!(browse(&mut p, sql)["rows"], json!([]), "{sql}");
+    }
+    let stats = column_stats(
+        &mut p,
+        &conn,
+        "person",
+        "best_friend",
+        json!("`best_friend` = 'person:bob extra'"),
+        json!({}),
+    )
+    .unwrap();
+    assert_eq!(stats["row_count"], 0);
+
+    // SurrealQL typed in the editor runs as written.
+    let r = query(
+        &mut p,
+        &conn,
+        "SELECT * FROM person WHERE best_friend = 'person:bob'",
+    );
+    assert_eq!(r["rows"], json!([]));
+}
+
+#[test]
 fn batches_run_as_one_script_with_per_statement_results() {
     let e = live!();
     let mut p = Plugin::start();
