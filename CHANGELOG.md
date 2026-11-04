@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Namespace and database users: Tabularis's connection form has a
+  Databases tab and no Database field for this driver, so Host, Port,
+  Username and Password alone send no namespace and only a root user can
+  sign in. The sign-in error now says to import a connection string with
+  the namespace and database (`surrealdb://user:pass@host:8000/ns/db`) and
+  keep it selected under Choose databases, and the README's Connecting
+  section describes the Databases tab and the connection string. No message
+  refers to a Database field any more.
+
 ## [0.1.0] - 2026-11-03
 
 First release: browse SurrealDB 2.x and 3.x namespaces and databases and run

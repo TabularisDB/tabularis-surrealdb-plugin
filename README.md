@@ -68,9 +68,35 @@ CBOR encoding. See [docs/DESIGN.md](docs/DESIGN.md#supported-surrealdb-versions)
 |---|---|
 | Host | Host name (`localhost`), or a URL: `ws://…`, `wss://…`, `http://…`, `https://…` |
 | Port | Port for a plain host name. Default 8000. Ignored when Host is a URL. |
-| Database | `namespace/database`. A bare `namespace` lets you pick databases in the explorer. Leave it empty to list every namespace you can see (root users). |
 | Username | A SurrealDB system user (root, namespace or database level) |
 | Password | That user's password. To sign in with a token, leave Username empty and paste the JWT here. |
+
+Tabularis shows a Databases tab for this driver instead of a Database
+field:
+
+- **All databases** (the default) lists every `namespace/database` the user
+  can see. No namespace is sent, so only a root user can sign in this way.
+- **Choose databases**: Load Databases lists them, and you pick the ones the
+  explorer shows.
+
+Namespace and database users sign in to a namespace (and database), and the
+form has no field for one. Create their connection from a connection string
+instead:
+
+```text
+surrealdb://reader:reader-pass@localhost:8000/namespace/database
+```
+
+The import selects Choose databases with `namespace/database`; keep it
+selected. For a namespace user, end the string at the namespace
+(`surrealdb://user:pass@localhost:8000/namespace`) and pick its databases
+from the list. With only Host, Port, Username and Password filled in, Test
+Connection and Load Databases sign in as a root user, so they fail for a
+namespace or database user.
+
+The imported connection has an empty SSL mode, which is Required (see
+below); set Disabled for a server without TLS, or Verify Identity to check
+the certificate.
 
 TLS: use the SSL tab, or put a `wss://` (or `https://`) URL in Host, for
 example `wss://my-instance.aws-euw1.surreal.cloud`.
@@ -99,18 +125,8 @@ create it.
 
 Sign-in level: by default the plugin tries a database user, then a
 namespace user, then a root user, and reports every level it tried if all
-fail. Namespace and database users need the namespace (and database) in the
-Database field.
-
-Connection strings can be imported:
-
-```text
-surrealdb://root:root@localhost:8000/namespace/database
-```
-
-The imported connection has an empty SSL mode, which is Required (see
-above); set Disabled for a server without TLS, or Verify Identity to check
-the certificate.
+fail. Namespace and database users need the namespace (and database), which
+the connection string gives (see above).
 
 Plugin settings (Settings, SurrealDB plugin):
 
@@ -175,6 +191,9 @@ Values in the grid:
   example `author = person:1` or `d = d'2024-01-02T00:00:00Z'`. See
   [Column statistics](docs/DESIGN.md#column-statistics).
 - The connection form has no field to pin the sign-in level; `auto` is used.
+- The connection form has no namespace or database field, so namespace and
+  database users connect through an imported connection string (see
+  [Connecting](#connecting)).
 
 ## Installation
 
