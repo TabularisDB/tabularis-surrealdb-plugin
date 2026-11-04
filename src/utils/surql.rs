@@ -252,6 +252,49 @@ fn rewrite_record_id_lookup(sql: &str) -> Option<String> {
     ))
 }
 
+/// Top-level keywords after which a SELECT no longer returns the records of
+/// its table.
+const NOT_RECORDS_KEYWORDS: &[&str] = &["SPLIT", "GROUP", "EXPLAIN"];
+
+/// The table that a query of the host's table-browse shape reads, and the
+/// byte range of the SELECT that reads it: ``SELECT * FROM `t` `` with only
+/// the WHERE, ORDER BY and LIMIT clauses the host adds, also inside its
+/// LIMIT wrapper (`SELECT * FROM (…)` after [`normalize_host_browse_query`]).
+/// The host quotes the table with backticks, so the same query typed in the
+/// editor without them is not taken for a table browse.
+pub fn host_browse(statement: &str) -> Option<(String, Range<usize>)> {
+    const WRAP_PREFIX: &str = "SELECT * FROM (";
+    if starts_with_ignore_case(statement, WRAP_PREFIX) && statement.ends_with(')') {
+        let inner = WRAP_PREFIX.len()..statement.len() - 1;
+        return browse_table(&statement[inner.clone()]).map(|table| (table, inner));
+    }
+    browse_table(statement).map(|table| (table, 0..statement.len()))
+}
+
+/// ``SELECT * FROM `t` [WHERE …] [ORDER BY …] [LIMIT …]`` → `t`.
+fn browse_table(sql: &str) -> Option<String> {
+    let rest = strip_prefix_ignore_case(sql, "SELECT * FROM ")?;
+    if !rest.starts_with('`') {
+        return None;
+    }
+    let (table, clauses) = parse_identifier(rest)?;
+    if (!clauses.is_empty() && !clauses.starts_with(char::is_whitespace)) || !is_balanced(clauses) {
+        return None;
+    }
+    match split_statements(clauses).as_slice() {
+        [] => Some(table),
+        [clauses]
+            if matches!(clauses.first_keyword(), Some("WHERE" | "ORDER" | "LIMIT"))
+                && !NOT_RECORDS_KEYWORDS
+                    .iter()
+                    .any(|k| clauses.has_top_level_keyword(k)) =>
+        {
+            Some(table)
+        }
+        _ => None,
+    }
+}
+
 fn strip_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     starts_with_ignore_case(s, prefix).then(|| &s[prefix.len()..])
 }
@@ -705,6 +748,46 @@ mod tests {
             "SELECT * FROM `person` WHERE `id` = 'person:alice' AND age > 3",
         ] {
             assert_eq!(normalize_host_browse_query(q), q);
+        }
+    }
+
+    #[test]
+    fn recognises_the_host_table_browse() {
+        let table = |sql: &str| host_browse(sql).map(|(t, _)| t);
+        for sql in [
+            "SELECT * FROM `person`",
+            "SELECT * FROM `person` WHERE name = 'Bob' ORDER BY age DESC",
+            "SELECT * FROM `person` ORDER BY name",
+            "SELECT * FROM `person` WHERE (name = 'x') AND `age` > 3 LIMIT 10",
+            // The foreign-key lookup after its rewrite.
+            "SELECT * FROM `person` WHERE id = <record> 'person:bob'",
+        ] {
+            assert_eq!(table(sql).as_deref(), Some("person"), "{sql}");
+        }
+        assert_eq!(
+            table("SELECT * FROM `odd\\`table` WHERE n = 1").as_deref(),
+            Some("odd`table")
+        );
+        // The LIMIT wrapper: the inner SELECT reads the table.
+        let sql = "SELECT * FROM (SELECT * FROM `person` WHERE age > 1 LIMIT 50)";
+        let (t, range) = host_browse(sql).unwrap();
+        assert_eq!(t, "person");
+        assert_eq!(&sql[range], "SELECT * FROM `person` WHERE age > 1 LIMIT 50");
+        for sql in [
+            // Typed in the editor: the host always quotes the table.
+            "SELECT * FROM person WHERE name = 'Bob'",
+            "SELECT name FROM `person`",
+            "SELECT * FROM `person`, `event`",
+            "SELECT * FROM `person`:bob",
+            "SELECT * FROM `person` WITH NOINDEX WHERE name = 'x'",
+            "SELECT * FROM `person` GROUP BY name",
+            "SELECT * FROM `person` SPLIT tags",
+            "SELECT * FROM `person` WHERE true EXPLAIN",
+            "SELECT * FROM `item` WHERE n >= $m }",
+            "SELECT * FROM (SELECT 1)",
+            "RETURN 1",
+        ] {
+            assert_eq!(table(sql), None, "{sql}");
         }
     }
 

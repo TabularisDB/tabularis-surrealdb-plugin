@@ -142,6 +142,10 @@ Plugin settings (Settings, SurrealDB plugin):
   rows with the union of their fields (`id` first, missing fields empty); a
   single object becomes one row; scalars and mixed arrays use a single
   `result` column.
+- A table tab also shows every declared field of the table, after `id` and
+  in declared order, even when no record on the page has it, so a filter or
+  a followed record link does not hide columns. Other fields of the records
+  follow. Queries typed in the editor show the fields of their result.
 - In a script, statements that never return data (`USE`, `LET`, `DEFINE`,
   `REMOVE`, `BEGIN`, `COMMIT`, …) produce no result tab, so a notebook cell
   shows the first real result. This goes by statement, so the result is the
