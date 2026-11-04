@@ -154,7 +154,10 @@ Plugin settings (Settings, SurrealDB plugin):
   rows.
 - The query Tabularis builds to follow a record link
   (`WHERE id = 'person:alice'`) is cast to a record id, so it finds the
-  linked record.
+  linked record. So is a filter from the column statistics popover or a
+  grid cell on a record id or record link column
+  (`` `best_friend` = 'person:bob' ``), in the grid and in the column
+  statistics.
 - `USE NS … DB …` inside a query applies to that query only; the
   connection keeps its namespace and database.
 - Generate SQL (SELECT, UPDATE, DELETE templates) produces SurrealQL.
@@ -190,9 +193,10 @@ Values in the grid:
 - The grid's filter bar may generate SQL operators SurrealQL does not have
   (for example `LIKE`); type the filter as SurrealQL instead.
 - Filtering by a value from the column statistics popover or a grid cell
-  quotes it as text, which SurrealQL never equals a record link, datetime,
-  duration or UUID (nor, from the popover, a boolean). Type those filters with a typed literal, for
-  example `author = person:1` or `d = d'2024-01-02T00:00:00Z'`. See
+  quotes it as text. The plugin casts that text for record ids and record
+  links, but SurrealQL never equals a datetime, duration or UUID (nor, from
+  the popover, a boolean) with text. Type those filters with a typed
+  literal, for example `d = d'2024-01-02T00:00:00Z'`. See
   [Column statistics](docs/DESIGN.md#column-statistics).
 - The connection form has no field to pin the sign-in level; `auto` is used.
 - The connection form has no namespace or database field, so namespace and

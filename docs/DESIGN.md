@@ -341,9 +341,36 @@ exact shape:
   escapes it with a backslash.
 - The host's foreign-key lookup,
   ``SELECT * FROM `t` WHERE `id` = 't:x'``, compares a record id with a
-  string, which never matches in SurrealQL. When the string starts with the
-  same table, it becomes ``WHERE id = <record> 't:x'`` (the value stays a
-  string literal). The same applies to that filter typed in the grid.
+  string, which never matches in SurrealQL. When the string is a record id
+  of the same table, it becomes ``WHERE id = <record> 't:x'`` (the value
+  stays a string literal). The same applies to that filter typed in the
+  grid.
+
+Filters by a record link's value. The column statistics popover and the
+grid's "filter by cell value" add `` `column` = 'value' `` to the tab's
+filter, with the value as text (see "Filtering by a top value" under Column
+statistics), and SurrealQL never equals a record with a string. In a table
+browse (``SELECT * FROM `t` `` with the host's WHERE, ORDER BY and LIMIT
+wrapper, the table quoted with backticks), and in the filter of
+`get_column_stats`, the plugin finds conditions of the form
+`column = '…'` that stand on their own (between WHERE, AND, OR, `&&`, `||`
+and round brackets; not field paths, parameters, parts of larger
+expressions, or anything inside a subquery or another statement). When the
+text is a record id, it reads the table's definitions (`INFO FOR DB` and
+`INFO FOR TABLE`, the same as `get_foreign_keys`), and casts the text to
+`<record> '…'` where the column links to that record's table: `id` (the
+table itself), a `record<…>` field (also inside `option<…>` or
+`none | …`), or a relation's `in` / `out`. Text compared with any other
+column, or a record of another table, is left alone.
+
+"A record id" is checked by the plugin, since the servers are lenient in
+different ways: 3.x casts the longest prefix it can read (`<record>
+'person:a b'` is `person:a`, `'person:1..5'` is `person:1`), and 2.x fails
+the whole statement. The table must be plain or backtick-quoted and the key
+written as the plugin writes them: plain (`bob`, `42`), backtick- or
+`⟨⟩`-quoted, a uuid (`u'…'`), or an array or object of plain values that
+ends with its closing bracket. Anything else stays text and matches
+nothing, as before. The foreign-key lookup above uses the same check.
 
 `get_table_query_template` (manifest `table_query_templates: true`) returns
 SurrealQL for the Generate SQL dialog. The live test runs the SELECT and
@@ -415,14 +442,17 @@ Only the parts the host asked for are added. Choices:
   (`formatSqlValueForFilter`), so the filter compares the column with a
   string. SurrealQL compares strictly (`person:1 = 'person:1'`,
   `d'2024-01-02T00:00:00Z' = '2024-01-02T00:00:00Z'` and `true = 'true'`
-  are all false on 2.x and 3.x), so for record links, datetimes, durations,
-  UUIDs and booleans that filter matches nothing. Strings and numbers work.
-  The grid's "filter by cell value" builds the same clause from the cell,
-  whose record links, datetimes, durations and UUIDs are already text, so it
-  has the same gap except for booleans. No value the plugin returns can avoid the quoting; fixing it needs
-  either the host to take a ready-made literal from the plugin, or the
-  plugin to cast string literals compared with typed columns in the grid
-  query. Until then it is listed under Limitations in the README.
+  are all false on 2.x and 3.x). The grid's "filter by cell value" builds
+  the same clause from the cell, whose record links, datetimes, durations
+  and UUIDs are already text. No value the plugin returns can avoid the
+  quoting. For record ids and record links, the plugin casts the text in
+  the grid query and in the statistics filter (see "Filters by a record
+  link's value" under Table browsing), so those filters find their records.
+  For datetimes, durations, UUIDs and, from the popover, booleans, the
+  filter still matches nothing; fixing that needs the host to take a
+  ready-made literal from the plugin, or the same cast for more column
+  types. It is listed under Limitations in the README. Strings and numbers
+  work.
 - **Filter.** The filter is inserted as `(<filter>\n)`: the newline keeps a
   trailing `--` comment from swallowing the bracket. It must have the shape
   of one condition (brackets, quotes and regex literals balance, no
