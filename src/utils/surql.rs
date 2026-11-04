@@ -7,7 +7,9 @@
 //! - where the top-level statements are (`;` outside any brackets),
 //! - which keywords appear at the top level of a statement (to decide whether
 //!   `LIMIT … START …` can be appended for pagination),
-//! - the first keyword of a statement (SELECT, USE, …).
+//! - the first keyword of a statement (SELECT, USE, …),
+//! - which conditions of a table filter compare a column with text (to cast
+//!   record links).
 //!
 //! It knows strings, comments, escaped identifiers (`` `…` ``, `⟨…⟩`) and
 //! regex literals (`/…/`), so a `;`, bracket or quote inside them is not
@@ -226,8 +228,9 @@ fn rewrite_doubled_backtick_table(sql: &str, open: usize) -> Option<String> {
 
 /// ``SELECT * FROM <table> WHERE <id> = '<table>:…'`` (the whole statement)
 /// → ``SELECT * FROM <table> WHERE id = <record> '<table>:…'``. Only rewritten
-/// when the string starts with the same table, so the cast cannot fail on
-/// unrelated text. The value stays a string literal: no injection.
+/// when the string is a record id of the same table ([`record_id_table`]),
+/// so the cast cannot fail on unrelated text or pick another record. The
+/// value stays a string literal: no injection.
 fn rewrite_record_id_lookup(sql: &str) -> Option<String> {
     let rest = strip_prefix_ignore_case(sql, "SELECT * FROM ")?;
     let (table, after_table) = parse_identifier(rest)?;
@@ -242,8 +245,7 @@ fn rewrite_record_id_lookup(sql: &str) -> Option<String> {
     if !rest.trim().is_empty() {
         return None;
     }
-    let prefix = format!("{}:", crate::utils::identifiers::format_identifier(&table));
-    if !value.starts_with(&prefix) || value.len() == prefix.len() {
+    if record_id_table(&value).as_deref() != Some(table.as_str()) {
         return None;
     }
     Some(format!(
@@ -354,6 +356,216 @@ fn ends_with_ignore_case(s: &str, suffix: &str) -> bool {
         && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
+/// The table of `text` when it is a record id written the way the plugin
+/// shows them (`utils::values::format_record_id`): a plain or
+/// backtick-quoted table, `:`, and a key that is plain (`bob`, `42`),
+/// quoted (`` `weird-id` ``, `⟨weird-id⟩`), a uuid (`u'…'`), or an array or
+/// object of plain values (`[2024, 'q1']`). Anything else is not taken for a
+/// record id: SurrealDB 3.x casts `'person:a b'` to `person:a`, and 2.x
+/// fails the whole query on it.
+pub fn record_id_table(text: &str) -> Option<String> {
+    let (table, rest) = parse_identifier(text)?;
+    let key = rest.strip_prefix(':')?;
+    is_record_key(key).then_some(table)
+}
+
+fn is_record_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match (chars.next(), chars.next()) {
+        (Some('`'), _) => is_quoted_run(key, '`'),
+        (Some('⟨'), _) => is_quoted_run(key, '⟩'),
+        (Some('u'), Some(q @ ('\'' | '"'))) => {
+            is_quoted_run(&key[1..], q)
+                && key[2..key.len() - 1]
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() || c == '-')
+        }
+        (Some('[' | '{'), _) => is_plain_collection(key),
+        (Some(_), _) => key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        (None, _) => false,
+    }
+}
+
+/// True when `s` is one non-empty quoted run: its first character opens it
+/// and `close` ends it at the very end (`\` escapes).
+fn is_quoted_run(s: &str, close: char) -> bool {
+    let Some(open) = s.chars().next() else {
+        return false;
+    };
+    let mut chars = s.char_indices().skip(1);
+    while let Some((i, c)) = chars.next() {
+        if c == '\\' {
+            chars.next();
+        } else if c == close {
+            return i > open.len_utf8() && i + c.len_utf8() == s.len();
+        }
+    }
+    false
+}
+
+/// True when `s` is an array or object whose first bracket closes at its
+/// end and which holds plain values only: numbers, strings (also `d'…'`,
+/// `u'…'`), `true`, `false`, `null`, `none`, and object keys.
+fn is_plain_collection(s: &str) -> bool {
+    let mut scanner = Scanner::new(s);
+    let mut tokens = Vec::new();
+    while scanner.next_event().is_some() {
+        tokens.push(scanner.token_start..scanner.pos);
+        if scanner.depth == 0 && scanner.pos < s.len() {
+            return false;
+        }
+    }
+    if scanner.depth != 0 || scanner.unterminated {
+        return false;
+    }
+    tokens.iter().enumerate().all(|(i, token)| {
+        let text = &s[token.clone()];
+        let next = tokens.get(i + 1);
+        match text.chars().next() {
+            Some(c) if c.is_ascii_digit() => true,
+            Some(c) if c.is_alphanumeric() || c == '_' => {
+                ["true", "false", "null", "none"]
+                    .iter()
+                    .any(|w| text.eq_ignore_ascii_case(w))
+                    // An object key.
+                    || next.is_some_and(|n| s[n.clone()].starts_with(':'))
+                    // A string prefix such as `d'…'`.
+                    || next.is_some_and(|n| {
+                        n.start == token.end && s[n.clone()].starts_with(['\'', '"'])
+                    })
+            }
+            Some(c) => "'\"[]{},:-+.".contains(c),
+            None => false,
+        }
+    })
+}
+
+/// A condition comparing a column with a single-quoted string: the column,
+/// the string's value and the byte range of the literal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextComparison {
+    pub column: String,
+    pub value: String,
+    pub literal: Range<usize>,
+}
+
+/// Statements that can sit inside a filter and have a WHERE of their own.
+const NESTED_STATEMENT_KEYWORDS: &[&str] = &[
+    "SELECT", "CREATE", "UPDATE", "UPSERT", "DELETE", "INSERT", "RELATE", "RETURN", "LET",
+];
+
+/// The `column = '…'` conditions in a filter or a SELECT, the way the host
+/// writes a filter by value: a plain or backtick-quoted column, `=`, and a
+/// single-quoted string (`''` or `\'` escapes), standing on its own between
+/// `WHERE`, `AND`, `OR`, `&&`, `||`, round brackets, the start or the end
+/// (or the SELECT's ORDER BY or LIMIT). Field paths (`a.b`), parameters,
+/// parts of larger expressions and anything inside `[…]` or `{…}` are not
+/// conditions of their own. A statement nested in `sql` could compare the
+/// columns of another table, so then there are none.
+pub fn text_comparisons(sql: &str) -> Vec<TextComparison> {
+    // Each token with whether it sits inside `[…]` or `{…}`.
+    let mut tokens: Vec<(Range<usize>, bool)> = Vec::new();
+    let mut open: Vec<char> = Vec::new();
+    let mut scanner = Scanner::new(sql);
+    while let Some(event) = scanner.next_event() {
+        let range = scanner.token_start..scanner.pos;
+        let text = &sql[range.clone()];
+        if matches!(event, Event::Word(_))
+            && scanner.depth > 0
+            && !scanner.last_word_is_member()
+            && NESTED_STATEMENT_KEYWORDS
+                .iter()
+                .any(|k| text.eq_ignore_ascii_case(k))
+        {
+            return Vec::new();
+        }
+        tokens.push((range, open.iter().any(|c| *c != '(')));
+        match text {
+            "(" | "[" | "{" => open.extend(text.chars()),
+            ")" | "]" | "}" => {
+                open.pop();
+            }
+            _ => {}
+        }
+    }
+    let text = |i: usize| tokens.get(i).map(|(r, _)| &sql[r.clone()]);
+    let is_any = |t: &str, words: &[&str]| words.iter().any(|w| t.eq_ignore_ascii_case(w));
+    let mut out = Vec::new();
+    for (i, (column_token, in_collection)) in tokens.iter().enumerate() {
+        let starts_condition = match i.checked_sub(1).and_then(text) {
+            None => true,
+            Some(t) => matches!(t, "(" | "&" | "|") || is_any(t, &["WHERE", "AND", "OR"]),
+        };
+        if *in_collection || !starts_condition || text(i + 1) != Some("=") {
+            continue;
+        }
+        let Some((column, "")) = parse_identifier(&sql[column_token.clone()]) else {
+            continue;
+        };
+        let Some((literal, _)) = tokens.get(i + 2) else {
+            continue;
+        };
+        let Some((value, rest)) = parse_single_quoted(&sql[literal.start..]) else {
+            continue;
+        };
+        let end = sql.len() - rest.len();
+        let after = tokens
+            .iter()
+            .find(|(r, _)| r.start >= end)
+            .map(|(r, _)| &sql[r.clone()]);
+        let ends_condition = match after {
+            None => true,
+            Some(t) => matches!(t, ")" | "&" | "|") || is_any(t, &["AND", "OR", "ORDER", "LIMIT"]),
+        };
+        if ends_condition {
+            out.push(TextComparison {
+                column,
+                value,
+                literal: literal.start..end,
+            });
+        }
+    }
+    out
+}
+
+/// True when `sql` compares a column with text that is a record id
+/// ([`text_comparisons`], [`record_id_table`]).
+pub fn compares_text_with_record_ids(sql: &str) -> bool {
+    text_comparisons(sql)
+        .iter()
+        .any(|c| record_id_table(&c.value).is_some())
+}
+
+/// Cast the strings that `sql` compares record-link columns with, so the
+/// comparison can match: SurrealQL never equals a record with a string. In
+/// a [`text_comparisons`] condition `column = 'table:key'`, when `links`
+/// says that `column` links to `table` and the text is a record id
+/// ([`record_id_table`]), the string becomes `<record> 'table:key'`. The
+/// value stays a string literal. `None` when nothing was cast.
+pub fn cast_record_link_literals(sql: &str, links: &[(String, Vec<String>)]) -> Option<String> {
+    let mut out = String::with_capacity(sql.len());
+    let mut copied = 0;
+    for comparison in text_comparisons(sql) {
+        let Some(table) = record_id_table(&comparison.value) else {
+            continue;
+        };
+        let links_to_table = links
+            .iter()
+            .any(|(column, tables)| *column == comparison.column && tables.contains(&table));
+        if !links_to_table {
+            continue;
+        }
+        out.push_str(&sql[copied..comparison.literal.start]);
+        out.push_str("<record> ");
+        out.push_str(&crate::utils::values::quote_string(&comparison.value));
+        copied = comparison.literal.end;
+    }
+    (copied > 0).then(|| {
+        out.push_str(&sql[copied..]);
+        out
+    })
+}
+
 /// True when `sql` has the shape of one expression: brackets, quotes and
 /// regex literals balance, and there is no top-level `;`. It can then be
 /// embedded as `WHERE (<sql>\n)` without changing the shape of the
@@ -407,6 +619,8 @@ pub(crate) struct Scanner<'a> {
     /// The most recent word, to tell a regex literal after a keyword
     /// (`WHERE /x/ …`) from a division after an operand (`n / 2`).
     last_word: Range<usize>,
+    /// Where the token that `next_event` returned last starts.
+    token_start: usize,
 }
 
 impl<'a> Scanner<'a> {
@@ -420,6 +634,7 @@ impl<'a> Scanner<'a> {
             prev_significant: None,
             prev_word_context: None,
             last_word: 0..0,
+            token_start: 0,
         }
     }
 
@@ -441,6 +656,7 @@ impl<'a> Scanner<'a> {
         loop {
             let ch = self.peek()?;
             let start = self.pos;
+            self.token_start = start;
             match ch {
                 c if c.is_whitespace() => {
                     self.pos += c.len_utf8();
@@ -746,6 +962,9 @@ mod tests {
             "SELECT * FROM `person` WHERE `id` = 'event:1'",
             "SELECT * FROM `person` WHERE `name` = 'person:alice'",
             "SELECT * FROM `person` WHERE `id` = 'person:alice' AND age > 3",
+            // Not a record id at all: 3.x would cast it to `person:a`.
+            "SELECT * FROM `person` WHERE `id` = 'person:a b'",
+            "SELECT * FROM `person` WHERE `id` = 'person:'",
         ] {
             assert_eq!(normalize_host_browse_query(q), q);
         }
@@ -843,5 +1062,142 @@ mod tests {
             texts("RETURN 1 // it's; a comment"),
             vec!["RETURN 1 // it's; a comment"]
         );
+    }
+
+    #[test]
+    fn reads_record_ids_written_like_the_plugin_writes_them() {
+        for (text, table) in [
+            ("person:bob", "person"),
+            ("person:42", "person"),
+            ("person:01abc", "person"),
+            ("event:`weird-id`", "event"),
+            ("event:⟨weird-id⟩", "event"),
+            ("event:[2024, 'q1']", "event"),
+            ("event:{ region: 'eu', seq: 7 }", "event"),
+            (
+                "event:[d'2024-01-02T00:00:00Z', -1.5f, true, NONE]",
+                "event",
+            ),
+            ("event:u'0190d6c0-0000-7000-8000-000000000001'", "event"),
+            ("`odd table`:x", "odd table"),
+        ] {
+            assert_eq!(record_id_table(text).as_deref(), Some(table), "{text}");
+        }
+        // SurrealDB 3.x would cast most of these to another record (the
+        // longest prefix it can read) and 2.x would fail the query.
+        for text in [
+            "Bob",
+            "person:",
+            ":bob",
+            "person bob:1",
+            "person:a b",
+            "person:bob)",
+            "person:bob:2",
+            "person:1..5",
+            "person:1.5",
+            "person:[1, 2]x",
+            "person:[1",
+            "person:[2024, oops]",
+            "person:{ a: oops }",
+            "person:`open",
+            "person:``",
+            "person:u'not-a-uuid'",
+        ] {
+            assert_eq!(record_id_table(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn finds_conditions_comparing_a_column_with_text() {
+        let found = |sql: &str| -> Vec<(String, String)> {
+            text_comparisons(sql)
+                .into_iter()
+                .map(|c| {
+                    assert!(sql[c.literal.clone()].starts_with('\''), "{sql}");
+                    (c.column, c.value)
+                })
+                .collect()
+        };
+        let pair = |c: &str, v: &str| (c.to_string(), v.to_string());
+        // The popover's filter, alone or added to the tab's own filter.
+        assert_eq!(
+            found("`best_friend` = 'person:bob'"),
+            [pair("best_friend", "person:bob")]
+        );
+        assert_eq!(
+            found("(name = 'Alice') AND `best_friend` = 'person:bob'"),
+            [pair("name", "Alice"), pair("best_friend", "person:bob")]
+        );
+        assert_eq!(
+            found("SELECT * FROM `event` WHERE `id` = 'event:[2024, ''q1'']' ORDER BY kind"),
+            [pair("id", "event:[2024, 'q1']")]
+        );
+        assert_eq!(
+            found("a = 'x' || (b = 'y' && c = 'z')"),
+            [pair("a", "x"), pair("b", "y"), pair("c", "z")]
+        );
+        // Not a condition of its own, or not `=` with a single-quoted string.
+        for sql in [
+            "a.best_friend = 'person:bob'",
+            "$best_friend = 'person:bob'",
+            "x + best_friend = 'person:bob'",
+            "best_friend = 'person:bob' + 'x'",
+            "best_friend = 'person:bob' IN [true]",
+            "best_friend != 'person:bob'",
+            "best_friend == 'person:bob'",
+            "best_friend = r'person:bob'",
+            "best_friend = \"person:bob\"",
+            "[best_friend = 'person:bob']",
+            // A subquery's WHERE belongs to its own table.
+            "best_friend IN (SELECT VALUE id FROM person WHERE best_friend = 'person:bob') OR best_friend = 'person:bob'",
+        ] {
+            assert_eq!(found(sql), [], "{sql}");
+        }
+    }
+
+    #[test]
+    fn casts_text_compared_with_record_links() {
+        let links = vec![
+            ("id".to_string(), vec!["person".to_string()]),
+            ("best_friend".to_string(), vec!["person".to_string()]),
+            (
+                "owner".to_string(),
+                vec!["person".to_string(), "bot".to_string()],
+            ),
+        ];
+        let cast = |sql: &str| cast_record_link_literals(sql, &links);
+        assert_eq!(
+            cast("`best_friend` = 'person:bob'").as_deref(),
+            Some("`best_friend` = <record> 'person:bob'")
+        );
+        assert_eq!(
+            cast("SELECT * FROM `person` WHERE (name = 'Alice') AND `best_friend` = 'person:bob' AND `id` = 'person:alice' ORDER BY name").as_deref(),
+            Some("SELECT * FROM `person` WHERE (name = 'Alice') AND `best_friend` = <record> 'person:bob' AND `id` = <record> 'person:alice' ORDER BY name")
+        );
+        assert_eq!(
+            cast("owner = 'bot:`r2-d2`'").as_deref(),
+            Some("owner = <record> 'bot:`r2-d2`'")
+        );
+        assert_eq!(
+            cast("`best_friend` = 'person:[2024, ''q1'']'").as_deref(),
+            Some("`best_friend` = <record> 'person:[2024, \\'q1\\']'")
+        );
+        assert!(compares_text_with_record_ids(
+            "`best_friend` = 'person:bob'"
+        ));
+        // Not a record link, a record of another table, not a record id, or
+        // not a condition of its own: untouched.
+        for sql in [
+            "name = 'person:bob'",
+            "best_friend = 'event:1'",
+            "best_friend = 'Bob'",
+            "best_friend = 'person:a b'",
+            "best_friend = 'person:bob' + ''",
+        ] {
+            assert_eq!(cast(sql), None, "{sql}");
+        }
+        assert!(!compares_text_with_record_ids(
+            "name = 'Bob' AND n = 'person:a b'"
+        ));
     }
 }

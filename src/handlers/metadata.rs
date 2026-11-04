@@ -310,10 +310,55 @@ pub async fn get_foreign_keys(ctx: &Context, params: &Json) -> Result<Json, Plug
     Ok(Json::Array(build_foreign_keys(&meta.def, &meta.fields)))
 }
 
+/// The columns of `table` that hold record ids, with the tables each may
+/// link to: `id` (the table itself) and the record links of
+/// [`record_link_columns`]. Used to cast the text a table filter compares
+/// them with.
+pub async fn record_links(
+    ctx: &Context,
+    config: &SessionConfig,
+    table: &str,
+) -> Result<Vec<(String, Vec<String>)>, PluginError> {
+    let meta = table_meta(ctx, config, table, false).await?;
+    let mut links = vec![("id".to_string(), vec![table.to_string()])];
+    links.extend(record_link_columns(&meta.def, &meta.fields));
+    Ok(links)
+}
+
 /// Build `get_foreign_keys` entries. A field that may link to several
 /// tables (`record<a | b>`) gets one entry per table, named `field→table`,
 /// so the host does not mistake them for one composite key.
 pub fn build_foreign_keys(table_def: &TableDef, fields: &[(String, String)]) -> Vec<Json> {
+    let mut out = Vec::new();
+    for (field, targets) in record_link_columns(table_def, fields) {
+        for target in &targets {
+            let name = if targets.len() == 1 {
+                field.clone()
+            } else {
+                format!("{field}→{target}")
+            };
+            out.push(json!({
+                "name": name,
+                "column_name": field,
+                "ref_table": target,
+                "ref_column": "id",
+                "on_delete": Json::Null,
+                "on_update": Json::Null,
+                "seq_in_fk": 1,
+            }));
+        }
+    }
+    out
+}
+
+/// Record links, each with the tables it may link to: top-level fields
+/// typed `record<t>` (also inside `option<…>` or `none | …`), and the `in`
+/// and `out` of relation tables when the server does not list them as
+/// fields (2.x).
+pub fn record_link_columns(
+    table_def: &TableDef,
+    fields: &[(String, String)],
+) -> Vec<(String, Vec<String>)> {
     let mut links: Vec<(String, Vec<String>)> = fields
         .iter()
         .filter(|(name, _)| is_top_level(name))
@@ -333,26 +378,7 @@ pub fn build_foreign_keys(table_def: &TableDef, fields: &[(String, String)]) -> 
             }
         }
     }
-    let mut out = Vec::new();
-    for (field, targets) in links {
-        for target in &targets {
-            let name = if targets.len() == 1 {
-                field.clone()
-            } else {
-                format!("{field}→{target}")
-            };
-            out.push(json!({
-                "name": name,
-                "column_name": field,
-                "ref_table": target,
-                "ref_column": "id",
-                "on_delete": Json::Null,
-                "on_update": Json::Null,
-                "seq_in_fk": 1,
-            }));
-        }
-    }
-    out
+    links
 }
 
 /// Is a field path top level (`name`, not `address.city` or `tags[*]`)?

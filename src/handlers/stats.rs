@@ -27,7 +27,7 @@ use ciborium::value::Value as Cbor;
 use serde_json::{json, Value as Json};
 
 use crate::error::PluginError;
-use crate::handlers::query::run;
+use crate::handlers::query::{cast_record_links, run};
 use crate::handlers::{require_database, session_config, Context};
 use crate::surreal::session::StatementOutcome;
 use crate::utils::identifiers::quote_identifier;
@@ -264,7 +264,14 @@ pub fn build_result(
 pub async fn get_column_stats(ctx: &Context, params: &Json) -> Result<Json, PluginError> {
     let config = session_config(params)?;
     require_database(&config)?;
-    let request = StatsRequest::from_params(params)?;
+    let mut request = StatsRequest::from_params(params)?;
+    // The tab's filter compares a record link with text when it came from
+    // a top value or a cell; cast it as the grid's query is.
+    if let Some(filter) = &request.filter {
+        if let Some(cast) = cast_record_links(ctx, &config, &request.table, filter).await {
+            request.filter = Some(cast);
+        }
+    }
     let timeout = ctx.settings().query_timeout_secs;
     let script = build_script(&request, SAMPLE_SIZE, timeout);
     // Each statement is stopped by the server at the timeout, so the script
