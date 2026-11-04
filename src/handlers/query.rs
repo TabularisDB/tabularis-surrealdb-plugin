@@ -24,8 +24,9 @@ use crate::surreal::session::{Session, StatementOutcome, TimedOutcome};
 use crate::surreal::{retry_class, Retry};
 use crate::utils::pagination::{offset_for, slice_page};
 use crate::utils::surql::{
-    can_push_down_pagination, host_browse, is_balanced, normalize_host_browse_query,
-    split_statements, with_pagination, Statement,
+    can_push_down_pagination, cast_record_link_literals, compares_text_with_record_ids,
+    host_browse, is_balanced, normalize_host_browse_query, split_statements, with_pagination,
+    Statement,
 };
 use crate::utils::values::is_none;
 use ciborium::value::Value as Cbor;
@@ -233,6 +234,8 @@ fn limit_param(params: &Json) -> Option<u64> {
 pub async fn execute_query(ctx: &Context, params: &Json) -> Result<Json, PluginError> {
     let config = session_config(params)?;
     let query = req_str(params, "query")?;
+    let cast = cast_browse_filter(ctx, &config, query).await;
+    let query = cast.as_deref().unwrap_or(query);
     let page = params.get("page").and_then(Json::as_u64).unwrap_or(1);
     let timeout = ctx.settings().query_timeout_secs;
     let mut plan = plan(query, limit_param(params), page, timeout)?;
@@ -263,6 +266,47 @@ pub async fn execute_query(ctx: &Context, params: &Json) -> Result<Json, PluginE
         statement.declared = declared;
     }
     build_response(outcomes, &plan.statements, answers)
+}
+
+/// The host's table browse with the record-link comparisons of its filter
+/// cast ([`cast_record_links`]); `None` for any other query, or when nothing
+/// was cast.
+async fn cast_browse_filter(ctx: &Context, config: &SessionConfig, query: &str) -> Option<String> {
+    let normalized = normalize_host_browse_query(query);
+    let (table, select) = host_browse(&normalized)?;
+    let cast = cast_record_links(ctx, config, &table, &normalized[select.clone()]).await?;
+    Some(format!(
+        "{}{cast}{}",
+        &normalized[..select.start],
+        &normalized[select.end..]
+    ))
+}
+
+/// `text` (a filter of `table`, or the host's browse of it) with the
+/// strings it compares record-link columns with cast to record ids
+/// ([`cast_record_link_literals`]), so that filtering by a link's value, as
+/// the column statistics popover and the grid's cell menu do, finds the
+/// record. The table's definitions are read only when `text` compares a
+/// column with a record id, within the query timeout. `None` when nothing
+/// was cast or they cannot be read.
+pub(crate) async fn cast_record_links(
+    ctx: &Context,
+    config: &SessionConfig,
+    table: &str,
+    text: &str,
+) -> Option<String> {
+    if !compares_text_with_record_ids(text) || require_database(config).is_err() {
+        return None;
+    }
+    let lookup = metadata::record_links(ctx, config, table);
+    let links = match ctx.settings().query_timeout_secs {
+        Some(secs) => tokio::time::timeout(Duration::from_secs(secs), lookup)
+            .await
+            .ok()?,
+        None => lookup.await,
+    }
+    .ok()?;
+    cast_record_link_literals(text, &links)
 }
 
 /// Send SurrealQL and return one outcome per answered statement, with hints

@@ -23,6 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `id` and every declared field of the table, in declared order, then any
   other field of the records, whichever records come back. Queries typed in
   the editor keep the columns of their result.
+- Clicking a record link among the top values in the column statistics
+  popover, or filtering by a record link cell, filtered to 0 rows: the host
+  writes the value as text (`` `best_friend` = 'person:bob' ``), which
+  SurrealQL never equals a record. In table tabs and in the column
+  statistics, text compared with a record id or record link column
+  (`record<…>`, `option<record<…>>`, relation `in` / `out`) is now cast to
+  a record id when it is one of the linked table's. Other text is left as
+  it is.
+- The cast of the query that follows a record link no longer applies to
+  text that only starts like a record id (`'person:a b'`), which
+  SurrealDB 3.x read as another record (`person:a`) and 2.x refused.
 
 ## [0.1.0] - 2026-11-03
 
