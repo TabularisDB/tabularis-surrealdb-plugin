@@ -197,6 +197,60 @@ fn connects_and_authenticates() {
     );
 }
 
+#[test]
+fn namespace_and_database_users_connect_through_a_connection_string() {
+    let e = live!();
+    let mut p = Plugin::start();
+    query(
+        &mut p,
+        &connection(&e, &main_db(&e), "ns-viewer-setup"),
+        "DEFINE USER IF NOT EXISTS ns_viewer ON NAMESPACE PASSWORD 'ns-viewer-pass' ROLES VIEWER",
+    );
+    let user = |database: &str, name: &str, password: &str, id: &str| {
+        let mut conn = connection(&e, database, id);
+        conn["username"] = json!(name);
+        conn["password"] = json!(password);
+        conn
+    };
+
+    // Tabularis's form has no Database field for this driver: with Host,
+    // Port, Username and Password alone, Test Connection and Load Databases
+    // send no namespace. The error says how to send one.
+    let form = user("", "reader", "reader-pass", "form-only");
+    for method in ["test_connection", "get_databases"] {
+        let (_, message) = p.call(method, json!({ "params": form })).unwrap_err();
+        assert!(
+            message.starts_with("Authentication failed as root user `reader`."),
+            "{method}: {message}"
+        );
+        assert!(
+            message.contains("import a connection string") && message.contains("Databases tab"),
+            "{method}: {message}"
+        );
+        assert!(!message.contains("Database field"), "{method}: {message}");
+    }
+
+    // An imported `surrealdb://reader:reader-pass@host:port/<ns>/<db>` sends
+    // `<ns>/<db>` with Test Connection, Load Databases and every later call.
+    let reader = user(&main_db(&e), "reader", "reader-pass", "imported-reader");
+    let ok = p.ok("test_connection", json!({ "params": reader }));
+    assert_eq!(ok["signed_in_as"], "database");
+    assert_eq!(
+        p.ok("get_databases", json!({ "params": reader })),
+        json!([main_db(&e)])
+    );
+
+    // A namespace user's string ends at the namespace; Load Databases then
+    // lists the databases to choose from.
+    let ns_viewer = user(&e.ns, "ns_viewer", "ns-viewer-pass", "imported-ns");
+    let ok = p.ok("test_connection", json!({ "params": ns_viewer }));
+    assert_eq!(ok["signed_in_as"], "namespace");
+    let dbs = p.ok("get_databases", json!({ "params": ns_viewer }));
+    for db in [main_db(&e), iso_db(&e)] {
+        assert!(dbs.as_array().unwrap().contains(&json!(db)), "{dbs}");
+    }
+}
+
 /// Does `name` exist under `key` of `INFO FOR <level>`, asked on `conn`?
 /// Read from the plain statement's result: 2.x cannot parse `INFO` as a
 /// subquery.

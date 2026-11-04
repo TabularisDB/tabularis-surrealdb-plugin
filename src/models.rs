@@ -184,12 +184,12 @@ impl SessionConfig {
         let auth = resolve_auth_level(params)?;
         if matches!(auth, AuthLevel::Namespace) && namespace.is_none() {
             return Err(PluginError::invalid_params(
-                "Namespace sign-in needs a namespace: set Database to `namespace` or `namespace/database`.",
+                "Namespace sign-in needs a namespace: connect to `namespace` or `namespace/database`.",
             ));
         }
         if matches!(auth, AuthLevel::Database) && database.is_none() {
             return Err(PluginError::invalid_params(
-                "Database sign-in needs both: set Database to `namespace/database`.",
+                "Database sign-in needs both: connect to `namespace/database`.",
             ));
         }
         Ok(Self {

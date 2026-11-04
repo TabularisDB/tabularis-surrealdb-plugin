@@ -88,9 +88,15 @@ pub fn auth_error(config: &SessionConfig, attempts: &[(AuthLevel, RpcError)]) ->
         }
         _ => {
             let mut hint = "Check the username and password.".to_string();
+            // Tabularis's connection form has no namespace or database field
+            // for this driver; only an imported connection string sets one.
             if config.namespace.is_none() {
                 hint.push_str(
-                    " Namespace and database users also need Database set to `namespace` or `namespace/database`.",
+                    " Without a namespace, only a root user can sign in. For a namespace or database user, import a connection string that names them, `surrealdb://user:pass@host:8000/namespace/database` (or `…/namespace`), and keep it selected under Choose databases in the Databases tab.",
+                );
+            } else if config.database.is_none() {
+                hint.push_str(
+                    " A database user also needs the database: connect to `namespace/database`.",
                 );
             }
             hint
@@ -136,17 +142,17 @@ pub fn with_hint(message: &str, config: &SessionConfig, signed_in_as: AuthLevel)
     }
     if lower.contains("namespace") && lower.contains("does not exist") {
         return format!(
-            "{message}. Check the namespace in the Database field (`namespace/database`). The plugin only connects to an existing namespace and never creates one."
+            "{message}. Check the namespace of the connection's `namespace/database` (chosen in its Databases tab, or the path of its connection string). The plugin only connects to an existing namespace and never creates one."
         );
     }
     if lower.contains("database") && lower.contains("does not exist") {
         return format!(
-            "{message}. Check the database in the Database field (`namespace/database`). The plugin only connects to an existing database and never creates one."
+            "{message}. Check the database of the connection's `namespace/database` (chosen in its Databases tab, or the path of its connection string). The plugin only connects to an existing database and never creates one."
         );
     }
     if lower.contains("specify a namespace") || lower.contains("specify a database") {
         return format!(
-            "{message}. Set the Database field to `namespace/database`, or select a database in the explorer."
+            "{message}. Select a database in the explorer, or choose a `namespace/database` in the connection's Databases tab."
         );
     }
     if lower.contains("timed out") || lower.contains("timeout") {
@@ -239,6 +245,81 @@ mod tests {
             .contains("There was a problem with authentication"));
         assert!(is_auth_failure(&attempts[0].1));
         assert!(!is_auth_failure(&RpcError::NotConnected));
+    }
+
+    #[test]
+    fn auth_errors_say_how_to_send_a_namespace() {
+        let failed = |levels: &[AuthLevel]| -> Vec<(AuthLevel, RpcError)> {
+            levels
+                .iter()
+                .map(|l| (*l, server("There was a problem with authentication")))
+                .collect()
+        };
+        // What the connection form sends without a connection string: no
+        // namespace, so only the root level was tried.
+        let no_namespace = SessionConfig {
+            namespace: None,
+            database: None,
+            ..config()
+        };
+        let e = auth_error(&no_namespace, &failed(&[AuthLevel::Root])).message;
+        assert!(
+            e.starts_with("Authentication failed as root user `reader`."),
+            "{e}"
+        );
+        assert!(e.contains("only a root user can sign in"), "{e}");
+        assert!(
+            e.contains("connection string that names them, `surrealdb://user:pass@host:8000/namespace/database`"),
+            "{e}"
+        );
+        assert!(e.contains("Choose databases in the Databases tab"), "{e}");
+        // A namespace alone: a database user still needs its database.
+        let namespace_only = SessionConfig {
+            database: None,
+            ..config()
+        };
+        let e = auth_error(
+            &namespace_only,
+            &failed(&[AuthLevel::Namespace, AuthLevel::Root]),
+        )
+        .message;
+        assert!(e.contains("connect to `namespace/database`"), "{e}");
+        // With both, the credentials are what is left to check.
+        let e = auth_error(&config(), &failed(&[AuthLevel::Database])).message;
+        assert!(
+            e.contains("Check the username and password. (SurrealDB:"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn hints_do_not_name_a_database_field() {
+        // Tabularis shows a Databases tab, not a Database field, for this
+        // driver.
+        let c = config();
+        let no_namespace = SessionConfig {
+            namespace: None,
+            database: None,
+            ..config()
+        };
+        let messages = [
+            with_hint("The namespace 'nope' does not exist", &c, AuthLevel::Root),
+            with_hint("The database 'nope' does not exist", &c, AuthLevel::Root),
+            with_hint("Specify a namespace to use", &c, AuthLevel::Root),
+            auth_error(
+                &no_namespace,
+                &[(
+                    AuthLevel::Root,
+                    server("There was a problem with authentication"),
+                )],
+            )
+            .message,
+        ];
+        for m in &messages {
+            assert!(!m.contains("Database field"), "{m}");
+            assert!(!m.contains("Database set"), "{m}");
+            assert!(m.contains("Databases tab"), "{m}");
+        }
     }
 
     #[test]
