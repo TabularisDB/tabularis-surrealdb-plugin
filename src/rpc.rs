@@ -142,6 +142,8 @@ mod tests {
     fn metadata_without_a_database_is_an_actionable_error() {
         let e = run("get_tables", json!({ "params": { "host": "localhost" } })).unwrap_err();
         assert!(e.message.contains("namespace/database"));
+        // The form has a Databases tab, not a Database field.
+        assert!(e.message.contains("Databases tab"), "{}", e.message);
         let request = json!({ "table": "t", "column": "c", "top_values_limit": 10,
             "include": { "distinct": true, "min_max": false, "top_values": true } });
         let e = run(

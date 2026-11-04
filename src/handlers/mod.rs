@@ -85,7 +85,7 @@ pub fn require_database(config: &SessionConfig) -> Result<(), PluginError> {
         Ok(())
     } else {
         Err(PluginError::invalid_params(
-            "No database selected. Set the connection's Database field to `namespace/database`, or pick a database in the explorer.",
+            "No database selected. Pick a database in the explorer, or choose a `namespace/database` in the connection's Databases tab.",
         ))
     }
 }
