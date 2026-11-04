@@ -550,6 +550,63 @@ fn browses_tables_with_limit_and_offset() {
 }
 
 #[test]
+fn filtered_table_browses_keep_every_declared_column() {
+    let e = live!();
+    let mut p = Plugin::start();
+    let conn = connection(&e, &main_db(&e), "declared");
+    let browse = |p: &mut Plugin, sql: &str| {
+        p.ok(
+            "execute_query",
+            json!({ "params": conn, "query": sql, "limit": 50, "page": 1 }),
+        )
+    };
+    // person is SCHEMAFULL; person:bob has no `age` and no `best_friend`.
+    let person = [
+        "id",
+        "address",
+        "age",
+        "balance",
+        "best_friend",
+        "name",
+        "tags",
+    ];
+    for (sql, rows) in [
+        // The grid's filter.
+        ("SELECT * FROM `person` WHERE name = 'Bob'", 1),
+        // Following person:alice's best_friend link.
+        ("SELECT * FROM `person` WHERE `id` = 'person:bob'", 1),
+        // A filter with a LIMIT set in the toolbar.
+        (
+            "SELECT * FROM (SELECT * FROM `person` WHERE name = 'Bob' LIMIT 5) AS limited_subset",
+            1,
+        ),
+        // No record at all.
+        ("SELECT * FROM `person` WHERE name = 'Nobody'", 0),
+    ] {
+        let r = browse(&mut p, sql);
+        assert_eq!(column_names(&r), person, "{sql}");
+        assert_eq!(r["rows"].as_array().unwrap().len(), rows, "{sql}");
+        if rows == 1 {
+            assert_eq!(cell(&r, 0, "id"), "person:bob", "{sql}");
+            assert_eq!(cell(&r, 0, "age"), &Value::Null, "{sql}");
+            assert_eq!(cell(&r, 0, "best_friend"), &Value::Null, "{sql}");
+        }
+    }
+
+    // SCHEMALESS: the declared fields, then the fields the records have.
+    let r = browse(&mut p, "SELECT * FROM `event` WHERE kind = 'odd'");
+    assert_eq!(column_names(&r), ["id", "actor", "kind", "extra"]);
+    assert_eq!(cell(&r, 0, "id"), "event:`weird-id`");
+
+    // Free SurrealQL in the editor keeps the columns of its result.
+    let r = query(&mut p, &conn, "SELECT * FROM person WHERE name = 'Bob'");
+    assert_eq!(
+        column_names(&r),
+        ["id", "address", "balance", "name", "tags"]
+    );
+}
+
+#[test]
 fn converts_values_and_keeps_record_ids_usable() {
     let e = live!();
     let mut p = Plugin::start();
