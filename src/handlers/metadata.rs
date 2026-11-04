@@ -235,6 +235,27 @@ pub async fn get_columns(ctx: &Context, params: &Json) -> Result<Json, PluginErr
     )))
 }
 
+/// The declared top-level fields of `table`, in server order, from
+/// `INFO FOR TABLE` alone. Used for the columns of a table browse.
+pub async fn declared_columns(
+    ctx: &Context,
+    config: &SessionConfig,
+    table: &str,
+) -> Result<Vec<String>, PluginError> {
+    ctx.sessions
+        .with_session(config, |session| {
+            let sql = format!("INFO FOR TABLE {}", quote_identifier(table));
+            async move {
+                let info = query_ok(&session, &sql, vec![]).await?;
+                Ok(definition_names(info.first(), "fields")
+                    .into_iter()
+                    .filter(|name| is_top_level(name))
+                    .collect())
+            }
+        })
+        .await
+}
+
 /// Columns for all tables at once (used by the host for autocomplete). Takes
 /// the same inputs as `get_columns`, per table.
 pub async fn get_all_columns_batch(ctx: &Context, params: &Json) -> Result<Json, PluginError> {

@@ -14,17 +14,18 @@ use std::time::Duration;
 use serde_json::{json, Value as Json};
 
 use crate::error::PluginError;
+use crate::handlers::metadata;
 use crate::handlers::results::{
-    pagination, query_result, query_result_with, tabulate, tabulate_items, Table,
+    pagination, query_result, query_result_with, tabulate, tabulate_items, tabulate_table, Table,
 };
-use crate::handlers::{req_str, session_config, Context};
+use crate::handlers::{req_str, require_database, session_config, Context};
 use crate::models::SessionConfig;
 use crate::surreal::session::{Session, StatementOutcome, TimedOutcome};
 use crate::surreal::{retry_class, Retry};
 use crate::utils::pagination::{offset_for, slice_page};
 use crate::utils::surql::{
-    can_push_down_pagination, is_balanced, normalize_host_browse_query, split_statements,
-    with_pagination, Statement,
+    can_push_down_pagination, host_browse, is_balanced, normalize_host_browse_query,
+    split_statements, with_pagination, Statement,
 };
 use crate::utils::values::is_none;
 use ciborium::value::Value as Cbor;
@@ -85,6 +86,9 @@ pub struct StatementPlan {
     /// First keyword, upper-cased (`SELECT`, `CREATE`, …).
     pub keyword: Option<String>,
     pub mode: PageMode,
+    /// For the host's table browse, the table's declared top-level fields:
+    /// they are columns of the result even when no returned record has them.
+    pub declared: Option<Vec<String>>,
 }
 
 /// What `execute_query` sends to the server.
@@ -94,6 +98,9 @@ pub struct Plan {
     pub statements: Vec<StatementPlan>,
     /// The query changes namespace/database with `USE`.
     pub uses_use: bool,
+    /// The table, when the query is the host's table browse (see
+    /// [`host_browse`]).
+    pub table: Option<String>,
 }
 
 /// Statements whose returned records are the records they changed.
@@ -172,8 +179,10 @@ pub fn plan(
             statements: vec![StatementPlan {
                 keyword: keyword(&statements[0]),
                 mode,
+                declared: None,
             }],
             uses_use,
+            table: host_browse(statements[0].text).map(|(table, _)| table),
         });
     }
     Ok(Plan {
@@ -183,9 +192,11 @@ pub fn plan(
             .map(|s| StatementPlan {
                 keyword: keyword(s),
                 mode: PageMode::None,
+                declared: None,
             })
             .collect(),
         uses_use,
+        table: None,
     })
 }
 
@@ -224,8 +235,33 @@ pub async fn execute_query(ctx: &Context, params: &Json) -> Result<Json, PluginE
     let query = req_str(params, "query")?;
     let page = params.get("page").and_then(Json::as_u64).unwrap_or(1);
     let timeout = ctx.settings().query_timeout_secs;
-    let plan = plan(query, limit_param(params), page, timeout)?;
-    let (outcomes, answers) = run(ctx, &config, &plan.sql, plan.uses_use, timeout).await?;
+    let mut plan = plan(query, limit_param(params), page, timeout)?;
+    // A table browse shows every declared field, also when no record on
+    // the page has it. The fields are read alongside the query (one
+    // WebSocket carries both), within the query timeout; without them the
+    // columns come from the data.
+    let declared = async {
+        let table = plan
+            .table
+            .as_ref()
+            .filter(|_| require_database(&config).is_ok())?;
+        let lookup = metadata::declared_columns(ctx, &config, table);
+        match timeout {
+            Some(secs) => tokio::time::timeout(Duration::from_secs(secs), lookup)
+                .await
+                .ok()?
+                .ok(),
+            None => lookup.await.ok(),
+        }
+    };
+    let (ran, declared) = tokio::join!(
+        run(ctx, &config, &plan.sql, plan.uses_use, timeout),
+        declared
+    );
+    let (outcomes, answers) = ran?;
+    if let [statement] = plan.statements.as_mut_slice() {
+        statement.declared = declared;
+    }
     build_response(outcomes, &plan.statements, answers)
 }
 
@@ -321,12 +357,17 @@ fn statement_result(value: Cbor, plan: Option<&StatementPlan>, time_ms: Option<f
     let is_write = plan
         .and_then(|p| p.keyword.as_deref())
         .is_some_and(|k| WRITE_KEYWORDS.contains(&k));
+    let declared = plan.and_then(|p| p.declared.as_deref());
+    let rows = |items: &[Cbor]| match declared {
+        Some(declared) => tabulate_table(items, declared),
+        None => tabulate_items(items),
+    };
     match (mode, value) {
         (PageMode::PushDown { page, size }, Cbor::Array(mut items)) => {
             let has_more = items.len() as u64 > size;
             items.truncate(usize::try_from(size).unwrap_or(usize::MAX));
             query_result_with(
-                tabulate_items(&items),
+                rows(&items),
                 Some(pagination(page, size, has_more)),
                 0,
                 time_ms,
@@ -335,11 +376,15 @@ fn statement_result(value: Cbor, plan: Option<&StatementPlan>, time_ms: Option<f
         (PageMode::Slice { page, size }, Cbor::Array(items)) => {
             let (items, has_more) = slice_page(items, offset_for(page, size), size);
             query_result_with(
-                tabulate_items(&items),
+                rows(&items),
                 Some(pagination(page, size, has_more)),
                 0,
                 time_ms,
             )
+        }
+        // A table browse without a page size.
+        (_, Cbor::Array(items)) if declared.is_some() => {
+            query_result_with(rows(&items), None, 0, time_ms)
         }
         (_, other) => {
             let affected = match (&other, is_write) {
@@ -507,6 +552,7 @@ fn plan_batch(
                 vec![StatementPlan {
                     keyword: statements[0].first_keyword().map(str::to_string),
                     mode,
+                    declared: None,
                 }],
             )
         } else {
@@ -517,6 +563,7 @@ fn plan_batch(
                     .map(|s| StatementPlan {
                         keyword: s.first_keyword().map(str::to_string),
                         mode: PageMode::None,
+                        declared: None,
                     })
                     .collect(),
             )
@@ -668,6 +715,46 @@ mod tests {
         let batch = local_timeout_error(30, 4).message;
         assert!(batch.contains("4 statements"), "{batch}");
         assert!(batch.contains("not each statement"), "{batch}");
+    }
+
+    #[test]
+    fn table_browses_show_the_declared_columns() {
+        let table = |sql: &str| plan(sql, Some(10), 1, None).unwrap().table;
+        for sql in [
+            "SELECT * FROM `person` WHERE name = 'Bob'",
+            "SELECT * FROM (SELECT * FROM `person` WHERE name = 'Bob' LIMIT 5) AS limited_subset",
+            // Following a record link opens the linked table.
+            "SELECT * FROM `person` WHERE `id` = 'person:bob'",
+        ] {
+            assert_eq!(table(sql).as_deref(), Some("person"), "{sql}");
+        }
+        // Free SurrealQL keeps the columns of its data.
+        for sql in [
+            "SELECT * FROM person WHERE name = 'Bob'",
+            "SELECT * FROM `person`; SELECT * FROM `event`",
+        ] {
+            assert_eq!(table(sql), None, "{sql}");
+        }
+
+        let mut plans = plan(
+            "SELECT * FROM `person` WHERE name = 'Bob'",
+            Some(10),
+            1,
+            None,
+        )
+        .unwrap()
+        .statements;
+        plans[0].declared = Some(vec!["age".into(), "name".into()]);
+        let text = |s: &str| Cbor::Text(s.into());
+        let id = Cbor::Tag(8, Box::new(Cbor::Array(vec![text("person"), text("bob")])));
+        let bob = Cbor::Map(vec![(text("id"), id), (text("name"), text("Bob"))]);
+        let r = respond(vec![ok(Cbor::Array(vec![bob]))], &plans).unwrap();
+        assert_eq!(r["columns"], json!(["id", "age", "name"]));
+        assert_eq!(r["rows"], json!([["person:bob", null, "Bob"]]));
+        let r = respond(vec![ok(Cbor::Array(vec![]))], &plans).unwrap();
+        assert_eq!(r["columns"], json!(["id", "age", "name"]));
+        assert_eq!(r["rows"], json!([]));
+        assert_eq!(r["pagination"]["has_more"], false);
     }
 
     #[test]
