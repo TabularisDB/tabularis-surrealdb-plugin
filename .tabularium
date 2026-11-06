@@ -2,7 +2,7 @@
   "$schema": "https://registry.tabularis.dev/manifest.schema.json?kind=driver",
   "id": "surrealdb",
   "name": "SurrealDB",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Connect to a SurrealDB namespace and database, browse schemafull and schemaless tables, fields and indexes, inspect records and run native SurrealQL.",
   "kind": "driver",
   "engine": "surrealdb",
@@ -17,6 +17,12 @@
   "color": "#ff00a0",
   "default_port": 8000,
   "default_username": "root",
+  "connection_fields": {
+    "database": {
+      "label": "Namespace/Database",
+      "placeholder": "namespace/database"
+    }
+  },
   "executable": "surrealdb-plugin",
   "capabilities": {
     "schemas": false,

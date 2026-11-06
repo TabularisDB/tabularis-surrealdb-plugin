@@ -155,15 +155,22 @@ Databases tab and no Database input. What the plugin receives:
 | Load Databases (`list_databases` → `get_databases`) | the form's `database` |
 | A saved connection | each chosen entry; for All databases, empty, and the host first lists them with `get_databases` |
 
-The form's `database` is empty unless a connection string was imported (its
-path) or a saved connection is being edited, and the Databases tab has no
-input for it. With Host, Port, Username and Password alone, no namespace
-reaches the plugin, so only a root user can sign in. A namespace or database
-user connects from an imported connection string,
+On 0.31.0 the form's `database` is empty unless a connection string was
+imported (its path) or a saved connection is being edited, and the Databases
+tab has no input for it. With Host, Port, Username and Password alone, no
+namespace reaches the plugin, so only a root user can sign in. A namespace
+or database user connects from an imported connection string,
 `surrealdb://user:pass@host:8000/namespace/database`: the import puts the
-path in the form's `database` and selects it under Choose databases. The
-sign-in error says this when no namespace was sent. A fix in the form
-needs Tabularis; see "Open questions".
+path in the form's `database` and selects it under Choose databases.
+
+Later Tabularis versions (TabularisDB/tabularis#1393) show an input bound to
+the form's `database` at the top of the Databases tab when a flat
+multi-database plugin declares `connection_fields.database`, which this
+manifest does (label "Namespace/Database"). The connection saves it as
+`default_database`, and the host sends it as `database` while no database is
+selected, so All databases signs in there too; a chosen database takes its
+place. Older hosts ignore the declaration. The sign-in error names both the
+field and the connection string when no namespace was sent.
 
 Existing namespaces and databases only: on SurrealDB 3.x, the `use` RPC
 creates a namespace or database that does not exist when the signed-in user
@@ -687,19 +694,11 @@ What maintainers still do, in order (details in
 - Auth level in the connection form: pinning it needs a
   `connection-modal.extra_fields` UI extension, i.e. a `ui/` bundle that
   `release.yml` does not build yet. Until then `auto` is used.
-- Namespace and database users in the connection form (see "Where
-  `database` comes from"). In Tabularis, `NewConnectionModal.tsx` could show
-  an input bound to the form's `database` on the Databases tab of a flat
-  multi-database driver that declares `connection_fields.database` (today
-  that declaration is only read where the Database input is shown, which
-  this driver never reaches). Load Databases and Test Connection already
-  send the form's `database`, so typing `namespace/database` there, loading
-  and choosing would be enough; the manifest would then declare a label and
-  placeholder for it. All databases would still drop it on save (`database:
-  ''`), so those users would keep using Choose databases. The plugin-only
-  alternative is the same `connection-modal.extra_fields` UI extension as
-  above, with namespace and database in `extra`, which the host passes to
-  every call, Test Connection and Load Databases included.
+- Namespace and database users in the connection form: resolved in
+  Tabularis after 0.31.0 (TabularisDB/tabularis#1393), which shows the
+  `connection_fields.database` this manifest declares on the Databases tab.
+  On 0.31.0 and older they still connect from a connection string; see
+  "Where `database` comes from".
 - Icon: the manifest has a brand colour but no `icon`, pending a decision on
   using SurrealDB's logo, so the registry card shows none.
 - Runtime floor: `0.26.0` follows from the features above. `0.29.0` would

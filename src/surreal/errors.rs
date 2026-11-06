@@ -88,11 +88,12 @@ pub fn auth_error(config: &SessionConfig, attempts: &[(AuthLevel, RpcError)]) ->
         }
         _ => {
             let mut hint = "Check the username and password.".to_string();
-            // Tabularis's connection form has no namespace or database field
-            // for this driver; only an imported connection string sets one.
+            // The namespace comes from Namespace/Database on the Databases
+            // tab (Tabularis after 0.31.0) or from an imported connection
+            // string; older forms have no field for it.
             if config.namespace.is_none() {
                 hint.push_str(
-                    " Without a namespace, only a root user can sign in. For a namespace or database user, import a connection string that names them, `surrealdb://user:pass@host:8000/namespace/database` (or `…/namespace`), and keep it selected under Choose databases in the Databases tab.",
+                    " Without a namespace, only a root user can sign in. For a namespace or database user, enter `namespace/database` (or `namespace`) in Namespace/Database on the connection's Databases tab, or import a connection string that names them, `surrealdb://user:pass@host:8000/namespace/database`.",
                 );
             } else if config.database.is_none() {
                 hint.push_str(
@@ -272,7 +273,10 @@ mod tests {
             e.contains("connection string that names them, `surrealdb://user:pass@host:8000/namespace/database`"),
             "{e}"
         );
-        assert!(e.contains("Choose databases in the Databases tab"), "{e}");
+        assert!(
+            e.contains("in Namespace/Database on the connection's Databases tab"),
+            "{e}"
+        );
         // A namespace alone: a database user still needs its database.
         let namespace_only = SessionConfig {
             database: None,
