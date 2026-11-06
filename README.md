@@ -79,9 +79,15 @@ field:
 - **Choose databases**: Load Databases lists them, and you pick the ones the
   explorer shows.
 
-Namespace and database users sign in to a namespace (and database), and the
-form has no field for one. Create their connection from a connection string
-instead:
+Namespace and database users sign in to a namespace (and database). Enter
+it in **Namespace/Database** at the top of the Databases tab:
+`namespace/database` for a database user, `namespace` for a namespace user.
+Load Databases and Test Connection then sign in there, and either mode
+works: All databases signs in to that value, and a chosen database takes
+its place. This field needs Tabularis newer than 0.31.0.
+
+On Tabularis 0.31.0 and older, the form has no such field. Create the
+connection from a connection string instead:
 
 ```text
 surrealdb://reader:reader-pass@localhost:8000/namespace/database
@@ -90,9 +96,8 @@ surrealdb://reader:reader-pass@localhost:8000/namespace/database
 The import selects Choose databases with `namespace/database`; keep it
 selected. For a namespace user, end the string at the namespace
 (`surrealdb://user:pass@localhost:8000/namespace`) and pick its databases
-from the list. With only Host, Port, Username and Password filled in, Test
-Connection and Load Databases sign in as a root user, so they fail for a
-namespace or database user.
+from the list. Without either, Test Connection and Load Databases sign in as
+a root user, so they fail for a namespace or database user.
 
 The imported connection has an empty SSL mode, which is Required (see
 below); set Disabled for a server without TLS, or Verify Identity to check
@@ -126,7 +131,7 @@ create it.
 Sign-in level: by default the plugin tries a database user, then a
 namespace user, then a root user, and reports every level it tried if all
 fail. Namespace and database users need the namespace (and database), which
-the connection string gives (see above).
+Namespace/Database or the connection string gives (see above).
 
 Plugin settings (Settings, SurrealDB plugin):
 
@@ -199,9 +204,9 @@ Values in the grid:
   literal, for example `d = d'2024-01-02T00:00:00Z'`. See
   [Column statistics](docs/DESIGN.md#column-statistics).
 - The connection form has no field to pin the sign-in level; `auto` is used.
-- The connection form has no namespace or database field, so namespace and
-  database users connect through an imported connection string (see
-  [Connecting](#connecting)).
+- On Tabularis 0.31.0 and older, the connection form has no namespace or
+  database field, so namespace and database users connect through an
+  imported connection string (see [Connecting](#connecting)).
 
 ## Installation
 
