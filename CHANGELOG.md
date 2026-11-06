@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-11-06
+
+### Added
+
+- Namespace and database users can connect from the connection form: the
+  manifest declares `connection_fields.database`, so Tabularis newer than
+  0.31.0 shows a Namespace/Database field on the Databases tab. Enter
+  `namespace/database` (or `namespace`) there; All databases signs in to it,
+  and a chosen database takes its place. Older Tabularis versions ignore the
+  field, and the connection string keeps working. The sign-in error now names
+  the field as well as the connection string.
+
 ## [0.1.1] - 2026-11-04
 
 ### Fixed
