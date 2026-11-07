@@ -339,6 +339,21 @@ as written and the page is cut out of the result. Statements that are not a
 single SELECT are never paginated, because the host re-runs the query for
 every page and a write must not be applied again.
 
+Nor is a SELECT with a statement that writes inside it: in a subquery or a
+block (`SELECT * FROM (UPDATE t SET n += 1)`), or after FROM without
+brackets (`SELECT * FROM UPDATE t SET n += 1`, which 2.x and 3.x both run).
+It runs once and returns every row. The plugin looks for CREATE, INSERT,
+UPDATE, UPSERT, DELETE, RELATE, DEFINE, REMOVE, ALTER and REBUILD anywhere
+in the statement, outside strings, comments and quoted names, and not as a
+field path, parameter, record id, function name or object key. SurrealQL
+reads these words as the start of a statement where an expression stands
+(`SELECT update FROM t` and `WHERE update = 1` do not parse on 2.x or 3.x).
+The few places that take one as a name (an edge table in `->update->`, a
+field in `ORDER BY update`) also turn paging off for that query, which then
+returns every row. A custom function that writes
+(`SELECT fn::bump() FROM t`) is not seen, and is paged like any other
+SELECT.
+
 Two host constructs are not valid SurrealQL and are rewritten, only in this
 exact shape:
 
