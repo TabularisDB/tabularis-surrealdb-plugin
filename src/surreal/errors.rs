@@ -2,11 +2,14 @@
 //! act on. The raw server message is always kept; a hint is appended when
 //! the cause is recognisable.
 
+use std::borrow::Cow;
+
 use crate::error::PluginError;
 use crate::models::{AuthLevel, SessionConfig};
 use crate::surreal::client::{ConnectError, RpcError};
 
 pub fn connect_error(url: &str, error: &ConnectError) -> PluginError {
+    let url = without_userinfo(url);
     let message = match error {
         ConnectError::Timeout(t) => format!(
             "Timed out after {}s connecting to {url}. Check Host and Port, and that no firewall blocks the connection.",
@@ -42,6 +45,28 @@ pub fn connect_error(url: &str, error: &ConnectError) -> PluginError {
         ConnectError::Other(e) => format!("Could not connect to SurrealDB at {url}: {e}"),
     };
     PluginError::internal(message)
+}
+
+/// `url` without the user name and password that a Host URL may carry
+/// (`wss://user:pass@host/rpc` → `wss://host/rpc`), so that a message
+/// showing the address never shows a password. The connection does not use
+/// them either: the plugin signs in with Username and Password.
+///
+/// The last `@` ends them, since a password may contain `@` or `/`. A bare
+/// `user:pass@host` in Host is bracketed like an IPv6 address
+/// (`ws://[user:pass@host]:8000/rpc`), and keeps its bracket.
+pub fn without_userinfo(url: &str) -> Cow<'_, str> {
+    let Some(scheme_end) = url.find("://") else {
+        return Cow::Borrowed(url);
+    };
+    let mut start = scheme_end + "://".len();
+    if url[start..].starts_with('[') {
+        start += 1;
+    }
+    match url[start..].rfind('@') {
+        Some(at) => Cow::Owned(format!("{}{}", &url[..start], &url[start + at + 1..])),
+        None => Cow::Borrowed(url),
+    }
 }
 
 /// Is this a rejected sign-in (wrong user, password, level or token)?
@@ -219,6 +244,50 @@ mod tests {
             plain.message
         );
         assert!(plain.message.contains("Disabled"));
+    }
+
+    #[test]
+    fn connect_errors_never_show_a_password() {
+        let url = "wss://admin:s3cret@db.example.com:8000/rpc";
+        for error in [
+            ConnectError::Timeout(Duration::from_secs(10)),
+            ConnectError::Http(404),
+            ConnectError::Io("Connection refused (os error 61)".into()),
+            ConnectError::Io("failed to lookup address information".into()),
+            ConnectError::Io("broken pipe".into()),
+            ConnectError::Tls("received corrupt message of type InvalidContentType".into()),
+            ConnectError::Tls("invalid peer certificate: UnknownIssuer".into()),
+            ConnectError::InvalidUrl("invalid uri character".into()),
+            ConnectError::Other("protocol error".into()),
+        ] {
+            let message = connect_error(url, &error).message;
+            assert!(!message.contains("s3cret"), "{message}");
+            assert!(!message.contains("admin"), "{message}");
+            assert!(
+                message.contains("wss://db.example.com:8000/rpc"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn strips_the_user_name_and_password_from_urls() {
+        for (url, shown) in [
+            (
+                "wss://user:pass@db.example.com/rpc",
+                "wss://db.example.com/rpc",
+            ),
+            ("ws://reader@127.0.0.1:8000/rpc", "ws://127.0.0.1:8000/rpc"),
+            // A password with `@` or `/` in it.
+            ("ws://u:p@ss/w@rd@127.0.0.1:1/rpc", "ws://127.0.0.1:1/rpc"),
+            // `user:pass@host` without a scheme, bracketed by `rpc_url`.
+            ("ws://[user:pass@host]:8000/rpc", "ws://[host]:8000/rpc"),
+            ("wss://db.example.com/rpc", "wss://db.example.com/rpc"),
+            ("ws://[::1]:8000/rpc", "ws://[::1]:8000/rpc"),
+            ("wss://user:pass@[::1]:8000/rpc", "wss://[::1]:8000/rpc"),
+        ] {
+            assert_eq!(without_userinfo(url), shown, "{url}");
+        }
     }
 
     #[test]
