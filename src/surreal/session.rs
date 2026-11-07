@@ -139,7 +139,7 @@ impl Session {
             {
                 return Ok(())
             }
-            Err(e) => return Err(self.rpc_error(e)),
+            Err(e) => return Err(self.handshake_error(e)),
         }
         if let Some(names) = self.info_names("INFO FOR NS", "databases").await? {
             if !names.contains(db) {
@@ -154,19 +154,11 @@ impl Session {
         Ok(())
     }
 
-    /// Names under `key` in the result of an `INFO FOR …` statement. `None`
-    /// when the signed-in user may not run it, or the result has no such
-    /// key, so the caller cannot tell either way.
+    /// Names under `key` in the result of an `INFO FOR …` statement; `None`
+    /// when the signed-in user may not run it. See [`listed_names`].
     async fn info_names(&self, sql: &str, key: &str) -> Result<Option<Vec<String>>, PluginError> {
-        let info = match self.query(sql, vec![]).await {
-            Ok(outcomes) => match outcomes.into_iter().next().map(|timed| timed.outcome) {
-                Some(StatementOutcome::Ok(info)) => info,
-                Some(StatementOutcome::Err(m)) if errors::is_permission_denied(&m) => {
-                    return Ok(None)
-                }
-                Some(StatementOutcome::Err(m)) => return Err(PluginError::internal(self.hint(&m))),
-                None => return Ok(None),
-            },
+        let outcome = match self.query(sql, vec![]).await {
+            Ok(outcomes) => outcomes.into_iter().next().map(|timed| timed.outcome),
             // 3.x rejects the whole call for anonymous sessions.
             Err(RpcError::Server(e))
                 if e.kind.as_deref() == Some("NotAllowed")
@@ -174,17 +166,23 @@ impl Session {
             {
                 return Ok(None)
             }
-            Err(e) => return Err(self.rpc_error(e)),
+            Err(e) => return Err(self.handshake_error(e)),
         };
-        Ok(definition_keys(&info, key))
+        listed_names(outcome, sql, key, &self.config.target()).map_err(|m| {
+            PluginError::internal(errors::with_handshake_hint(
+                &m,
+                &self.config,
+                self.signed_in_as,
+            ))
+        })
     }
 
     pub fn is_closed(&self) -> bool {
         self.client.is_closed()
     }
 
-    /// (Re)select the configured namespace and database.
-    pub async fn use_target(&self) -> Result<(), PluginError> {
+    /// Select the configured namespace and database.
+    async fn use_target(&self) -> Result<(), PluginError> {
         let ns = self
             .config
             .namespace
@@ -201,7 +199,7 @@ impl Session {
             .call("use", vec![ns, db])
             .await
             .map(|_| ())
-            .map_err(|e| self.rpc_error(e))
+            .map_err(|e| self.handshake_error(e))
     }
 
     /// Run SurrealQL and return one outcome per statement. Statement errors
@@ -279,6 +277,19 @@ impl Session {
             other => PluginError::internal(other.to_string()),
         }
     }
+
+    /// Like [`Self::rpc_error`], for checking and selecting the namespace
+    /// and database while connecting ([`errors::with_handshake_hint`]).
+    fn handshake_error(&self, error: RpcError) -> PluginError {
+        match error {
+            RpcError::Server(e) => PluginError::internal(errors::with_handshake_hint(
+                &e.message,
+                &self.config,
+                self.signed_in_as,
+            )),
+            other => PluginError::internal(other.to_string()),
+        }
+    }
 }
 
 /// Run one handshake step under [`HANDSHAKE_TIMEOUT`]; `stage` names the
@@ -297,6 +308,31 @@ fn timeout_error(stage: &str) -> PluginError {
         "SurrealDB did not answer within {}s while {stage}.",
         HANDSHAKE_TIMEOUT.as_secs()
     ))
+}
+
+/// The names under `key` (`namespaces`, `databases`) in the `outcome` of the
+/// `INFO FOR …` statement `sql`, which checks that `target` exists; `None`
+/// when the signed-in user may not run it. Anything else is an error: a
+/// result without that map does not say that the namespace or database
+/// exists, and `use` would then create it.
+fn listed_names(
+    outcome: Option<StatementOutcome>,
+    sql: &str,
+    key: &str,
+    target: &str,
+) -> Result<Option<Vec<String>>, String> {
+    match outcome {
+        Some(StatementOutcome::Ok(info)) => definition_keys(&info, key).map(Some).ok_or_else(|| {
+            format!(
+                "Could not check that `{target}` exists: `{sql}` returned no `{key}`. The plugin only selects a namespace and database it has seen, so that it never creates one."
+            )
+        }),
+        Some(StatementOutcome::Err(m)) if errors::is_permission_denied(&m) => Ok(None),
+        Some(StatementOutcome::Err(m)) => Err(m),
+        None => Err(format!(
+            "Could not check that `{target}` exists: `{sql}` returned no result."
+        )),
+    }
 }
 
 /// Keys of the definition map `key` (`namespaces`, `databases`, …) of an
@@ -551,6 +587,51 @@ mod tests {
         );
         assert_eq!(definition_keys(&info, "databases"), None);
         assert_eq!(definition_keys(&Cbor::Null, "namespaces"), None);
+    }
+
+    #[test]
+    fn the_existence_check_needs_the_list_it_reads() {
+        let check = |outcome: Option<StatementOutcome>| {
+            listed_names(outcome, "INFO FOR ROOT", "namespaces", "app/main")
+        };
+        let info = |entries| Some(StatementOutcome::Ok(map(entries)));
+        assert_eq!(
+            check(info(vec![(
+                "namespaces",
+                map(vec![("app", Cbor::Text("DEFINE NAMESPACE app".into()))])
+            )])),
+            Ok(Some(vec!["app".into()]))
+        );
+        assert_eq!(
+            check(info(vec![("namespaces", map(vec![]))])),
+            Ok(Some(vec![]))
+        );
+        // Not allowed: the server's own permissions decide.
+        assert_eq!(
+            check(Some(StatementOutcome::Err(
+                "IAM error: Not enough permissions to perform this action".into()
+            ))),
+            Ok(None)
+        );
+        // A result shaped another way does not say that `app` exists.
+        for outcome in [
+            info(vec![("users", map(vec![]))]),
+            info(vec![("namespaces", Cbor::Null)]),
+            Some(StatementOutcome::Ok(Cbor::Null)),
+            None,
+        ] {
+            let e = check(outcome.clone()).unwrap_err();
+            assert!(
+                e.starts_with(
+                    "Could not check that `app/main` exists: `INFO FOR ROOT` returned no"
+                ),
+                "{outcome:?}: {e}"
+            );
+        }
+        assert_eq!(
+            check(Some(StatementOutcome::Err("Parse error".into()))),
+            Err("Parse error".into())
+        );
     }
 
     #[test]

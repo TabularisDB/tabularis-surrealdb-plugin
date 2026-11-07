@@ -19,6 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Tabularis runs the query again for each page, so opening the next page
   applied the write again. Such a SELECT now runs once and shows every row,
   in the editor and in "Run all", like the other writes.
+- A Namespace/Database with a database but no namespace (`/typo`, also
+  imported from `surrealdb://user:pass@host:8000//typo`) connected without
+  checking or selecting anything, and Test Connection succeeded for a root
+  user. It is now refused with a message that asks for
+  `namespace/database`.
+- When `INFO FOR ROOT` or `INFO FOR NS` succeeded without listing the
+  namespaces or databases, the check that they exist passed, so `use` could
+  create a missing one on SurrealDB 3.x. The connection now fails instead.
+  2.x and 3.x list both, so connections to them are unchanged.
+- An editor query naming a missing namespace or database
+  (`REMOVE DATABASE ghost`) got the hint to check the connection's
+  `namespace/database`. Only errors while connecting get it now; the editor
+  shows the server's message.
 
 ## [0.1.2] - 2026-11-06
 

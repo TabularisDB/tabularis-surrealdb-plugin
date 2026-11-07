@@ -126,7 +126,7 @@ not used by SurrealDB and are rejected.
 
 The namespace and database must exist. The plugin checks this before
 selecting them and reports a missing one, instead of letting SurrealDB 3.x
-create it.
+create it. A database needs its namespace: `/database` is refused.
 
 Sign-in level: by default the plugin tries a database user, then a
 namespace user, then a root user, and reports every level it tried if all

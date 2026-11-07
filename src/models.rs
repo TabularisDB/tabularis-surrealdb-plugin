@@ -7,7 +7,7 @@
 //! |-----------------|------------------------------------------------------|
 //! | Host            | host name, or a full `ws://` / `wss://` / `http(s)://` URL |
 //! | Port            | port (default 8000); ignored when Host is a URL with a port |
-//! | Database        | `namespace/database`, `namespace`, or empty          |
+//! | Database        | `namespace/database`, `namespace`, or empty (not `/database`) |
 //! | Username        | system user name (root, namespace or database user)  |
 //! | Password        | that user's password, or a JWT when Username is empty |
 //!
@@ -181,6 +181,14 @@ impl SessionConfig {
             url = format!("wss://{}", &url["ws://".len()..]);
         }
         let (namespace, database) = split_namespace_database(params.database.as_deref());
+        // `/typo` would select no namespace, so nothing would be checked or
+        // selected, and a root user would get an empty connection.
+        if namespace.is_none() && database.is_some() {
+            return Err(PluginError::invalid_params(format!(
+                "`{}` has a database but no namespace. Enter `namespace/database` in Namespace/Database on the connection's Databases tab, or in the path of its connection string.",
+                params.database.as_deref().unwrap_or_default().trim()
+            )));
+        }
         let auth = resolve_auth_level(params)?;
         if matches!(auth, AuthLevel::Namespace) && namespace.is_none() {
             return Err(PluginError::invalid_params(
@@ -502,5 +510,32 @@ mod tests {
         assert!(base(Some("u"), Some("p"), Some("database"), Some("ns/db")).is_ok());
         assert!(base(Some("u"), None, Some("token"), None).is_err());
         assert!(base(Some("u"), Some("p"), Some("weird"), None).is_err());
+    }
+
+    #[test]
+    fn a_database_needs_a_namespace() {
+        let cfg = |db: &str| {
+            SessionConfig::from_params(&ConnectionParams {
+                username: Some("root".into()),
+                password: Some("root".into()),
+                database: Some(db.into()),
+                ..Default::default()
+            })
+        };
+        for db in ["/typo", " /typo", "/a/b"] {
+            let e = cfg(db).unwrap_err();
+            assert_eq!(e.code, crate::error::INVALID_PARAMS, "{db}");
+            assert!(
+                e.message
+                    .starts_with(&format!("`{}` has a database but no namespace.", db.trim())),
+                "{}",
+                e.message
+            );
+            assert!(e.message.contains("Databases tab"), "{}", e.message);
+        }
+        // A namespace alone, both, or neither.
+        for db in ["app", "app/", "app/main", "", "/"] {
+            assert!(cfg(db).is_ok(), "{db}");
+        }
     }
 }
