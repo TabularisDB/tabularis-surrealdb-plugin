@@ -132,7 +132,7 @@ passes such errors through unchanged.
 |---|---|
 | Host | host name, or a URL (`ws://`, `wss://`, `http://`, `https://`); `/rpc` is appended |
 | Port | port for a bare host name (default 8000) |
-| `database` (no form field, see below) | `namespace/database`, `namespace`, or empty |
+| `database` (no form field, see below) | `namespace/database`, `namespace`, or empty; not `/database` |
 | Username / Password | a system user (root, namespace or database level) |
 | Password with empty Username | a JWT, used with `authenticate` |
 
@@ -172,6 +172,12 @@ selected, so All databases signs in there too; a chosen database takes its
 place. Older hosts ignore the declaration. The sign-in error names both the
 field and the connection string when no namespace was sent.
 
+A database without a namespace (`/typo`, typed in that field or imported
+from `surrealdb://user:pass@host:8000//typo`) is refused before connecting,
+with `-32602` and a message that asks for `namespace/database`. There would
+be no namespace to check or select, so a root user got a connection that
+selects nothing, and Test Connection succeeded on it.
+
 Existing namespaces and databases only: on SurrealDB 3.x, the `use` RPC
 creates a namespace or database that does not exist when the signed-in user
 may define one (root users both, namespace OWNERs and EDITORs a database).
@@ -187,9 +193,22 @@ names a missing namespace in `use`:
 A missing namespace or database fails with "The namespace 'x' does not
 exist" (or database), plus a hint to check
 the connection's `namespace/database`. This covers "Test connection" and
-every other request.
+every other request. Only errors while connecting get that hint: a missing
+namespace or database named in a query typed in the editor
+(`REMOVE DATABASE ghost`) is not the connection's, so the server's message
+is shown as it is.
+
+Names are compared as they are. `INFO FOR ROOT` and `INFO FOR NS` key
+namespaces and databases by their raw names on 2.x and 3.x (`my-ns`, `a b`,
+not `` `my-ns` ``), and `use` takes raw names; the live test
+`namespaces_and_databases_whose_names_need_quoting_are_found` checks both
+on 2.7.0 and 3.3.5.
+
 A check the signed-in user may not run is skipped, and the server's own
-permissions decide. Checked against 3.2:
+permissions decide. A check that runs must find its list: when `INFO`
+succeeds but has no `namespaces` (or `databases`) map, the connection fails
+with "Could not check that `ns/db` exists", since passing would let `use`
+create a missing one. Checked against 3.2:
 
 - Root users: both checks run.
 - Namespace users cannot run `INFO FOR ROOT`, but they can only sign in to
