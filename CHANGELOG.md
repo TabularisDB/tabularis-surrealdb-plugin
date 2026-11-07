@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Connection errors repeat the address they tried, so a Host URL with a
+  user name and password (`wss://user:pass@host`) showed the password. They
+  are now left out (`wss://host/rpc`). The plugin never used them: it signs
+  in with Username and Password.
+
 ## [0.1.2] - 2026-11-06
 
 ### Added
