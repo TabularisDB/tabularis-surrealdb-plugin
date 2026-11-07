@@ -1108,6 +1108,52 @@ fn result_shapes_writes_and_empty_results() {
 }
 
 #[test]
+fn selects_that_write_run_once_and_are_not_paged() {
+    let e = live!();
+    let mut p = Plugin::start();
+    let conn = connection(&e, &main_db(&e), "select-writes");
+    query(
+        &mut p,
+        &conn,
+        "REMOVE TABLE IF EXISTS paged_write; DEFINE TABLE paged_write SCHEMALESS;\n\
+         CREATE paged_write:1 SET n = 0; CREATE paged_write:2 SET n = 0;\n\
+         CREATE paged_write:3 SET n = 0;",
+    );
+    let counts =
+        |p: &mut Plugin| query(p, &conn, "SELECT VALUE n FROM paged_write")["rows"].clone();
+
+    // The host runs a paged query again for every page, so a SELECT that
+    // writes comes back whole, with no further page to ask for. 2.x and 3.x
+    // also run the write after FROM without brackets.
+    for (sql, n) in [
+        ("SELECT * FROM (UPDATE paged_write SET n += 1)", 1),
+        ("SELECT * FROM UPDATE paged_write SET n += 1", 2),
+    ] {
+        let r = p.ok(
+            "execute_query",
+            json!({ "params": conn, "query": sql, "limit": 2, "page": 1 }),
+        );
+        assert_eq!(r["rows"].as_array().unwrap().len(), 3, "{sql}: {r}");
+        assert!(r["pagination"].is_null(), "{sql}: {r}");
+        assert_eq!(counts(&mut p), json!([[n], [n], [n]]), "{sql}");
+    }
+    // The editor's "run all" too.
+    let out = p.ok(
+        "execute_query_batch",
+        json!({ "params": conn, "queries": ["SELECT * FROM (UPDATE paged_write SET n += 1)"],
+                "limit": 2, "page": 1 }),
+    );
+    assert_eq!(
+        out[0]["result"]["rows"].as_array().unwrap().len(),
+        3,
+        "{out}"
+    );
+    assert!(out[0]["result"]["pagination"].is_null(), "{out}");
+    assert_eq!(counts(&mut p), json!([[3], [3], [3]]));
+    query(&mut p, &conn, "REMOVE TABLE paged_write");
+}
+
+#[test]
 fn query_timeout_is_enforced_with_actionable_errors() {
     let e = live!();
     let mut p = plugin_with_settings(json!({ "query_timeout_seconds": 1 }));

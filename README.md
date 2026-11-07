@@ -143,6 +143,9 @@ Plugin settings (Settings, SurrealDB plugin):
 
 - Opening a table runs `SELECT * FROM <table>` with `LIMIT … START …` for
   the current page.
+- A SELECT with a write inside it, such as
+  `SELECT * FROM (UPDATE person SET seen = true)`, is not paged: Tabularis
+  runs the query again for every page, so it runs once and shows every row.
 - Statement results map to the grid as follows: an array of records becomes
   rows with the union of their fields (`id` first, missing fields empty); a
   single object becomes one row; scalars and mixed arrays use a single

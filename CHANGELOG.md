@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   user name and password (`wss://user:pass@host`) showed the password. They
   are now left out (`wss://host/rpc`). The plugin never used them: it signs
   in with Username and Password.
+- A SELECT with a write inside it, such as
+  `SELECT * FROM (UPDATE person SET n += 1)` or
+  `SELECT * FROM UPDATE person SET n += 1`, was paged like any SELECT.
+  Tabularis runs the query again for each page, so opening the next page
+  applied the write again. Such a SELECT now runs once and shows every row,
+  in the editor and in "Run all", like the other writes.
 
 ## [0.1.2] - 2026-11-06
 
