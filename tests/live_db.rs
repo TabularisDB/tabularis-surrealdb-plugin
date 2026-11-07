@@ -347,6 +347,14 @@ fn unreachable_server_is_reported() {
         .call("test_connection", json!({ "params": conn }))
         .unwrap_err();
     assert!(message.contains("ws://127.0.0.1:1/rpc"), "{message}");
+
+    // A user name and password in a Host URL are not shown.
+    conn["host"] = json!("ws://reader:secret-pass@127.0.0.1:1");
+    let (_, message) = p
+        .call("test_connection", json!({ "params": conn }))
+        .unwrap_err();
+    assert!(message.contains("ws://127.0.0.1:1/rpc"), "{message}");
+    assert!(!message.contains("secret-pass"), "{message}");
 }
 
 #[test]
