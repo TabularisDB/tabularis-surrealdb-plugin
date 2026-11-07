@@ -332,6 +332,128 @@ fn missing_namespace_or_database_is_refused_and_not_created() {
     assert!(!defined(&mut p, &main, "ROOT", "namespaces", &ghost_ns));
     assert!(defined(&mut p, &main, "NS", "databases", &e.db));
     assert!(!defined(&mut p, &main, "NS", "databases", &ghost_db));
+
+    // A database without a namespace (`/<db>`) would select nothing, and a
+    // root user would get an empty connection.
+    let no_namespace = connection(&e, &format!("/{}", e.db), "no-namespace");
+    for (method, params) in [
+        ("test_connection", json!({ "params": no_namespace })),
+        ("get_databases", json!({ "params": no_namespace })),
+        (
+            "execute_query",
+            json!({ "params": no_namespace, "query": "INFO FOR DB", "page": 1 }),
+        ),
+    ] {
+        let (code, message) = p.call(method, params).unwrap_err();
+        assert_eq!(code, -32602, "{method}: {message}");
+        assert!(
+            message.starts_with(&format!("`/{}` has a database but no namespace.", e.db)),
+            "{method}: {message}"
+        );
+    }
+
+    // In a query typed in the editor, a missing namespace or database is
+    // not the connection's: the server's message comes without the hint.
+    for (sql, expected) in [
+        (format!("REMOVE DATABASE {ghost_db}"), &db_missing),
+        (format!("REMOVE NAMESPACE {ghost_ns}"), &ns_missing),
+    ] {
+        let (_, message) = p
+            .call(
+                "execute_query",
+                json!({ "params": main, "query": sql, "page": 1 }),
+            )
+            .unwrap_err();
+        let batch = p.ok(
+            "execute_query_batch",
+            json!({ "params": main, "queries": [sql], "page": 1 }),
+        );
+        for message in [message.as_str(), batch[0]["error"].as_str().unwrap()] {
+            assert!(message.starts_with(expected.as_str()), "{sql}: {message}");
+            assert!(
+                !message.contains("Databases tab") && !message.contains("never creates"),
+                "{sql}: {message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn namespaces_and_databases_whose_names_need_quoting_are_found() {
+    let e = live!();
+    let mut p = Plugin::start();
+    query(
+        &mut p,
+        &connection(&e, "", "quoting-setup"),
+        "DEFINE NAMESPACE IF NOT EXISTS `my-ns`; USE NS `my-ns`;\n\
+         DEFINE DATABASE IF NOT EXISTS `a b`;\n\
+         DEFINE USER IF NOT EXISTS ns_editor ON NAMESPACE PASSWORD 'ns-editor-pass' ROLES EDITOR;",
+    );
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let ghost_db = format!("ghost b {suffix}");
+    let ghost_ns = format!("ghost-ns-{suffix}");
+
+    // The check reads `INFO FOR ROOT` and `INFO FOR NS`, whose keys are the
+    // raw names, and `use` takes them as they are.
+    let root = connection(&e, "my-ns/a b", "quoting-root");
+    assert_eq!(
+        p.ok("test_connection", json!({ "params": root }))["signed_in_as"],
+        "root"
+    );
+    query(&mut p, &root, "UPSERT marker:here SET db = 'a b'");
+    assert_eq!(
+        query(&mut p, &root, "SELECT db FROM marker:here")["rows"],
+        json!([["a b"]])
+    );
+    let dbs = p.ok("get_databases", json!({ "params": root }));
+    assert!(
+        dbs.as_array().unwrap().contains(&json!("my-ns/a b")),
+        "{dbs}"
+    );
+    // A namespace user runs only the `INFO FOR NS` check.
+    let mut editor = connection(&e, "my-ns/a b", "quoting-editor");
+    editor["username"] = json!("ns_editor");
+    editor["password"] = json!("ns-editor-pass");
+    assert_eq!(
+        p.ok("test_connection", json!({ "params": editor }))["signed_in_as"],
+        "namespace"
+    );
+
+    // Missing ones are still refused, and not created.
+    let mut missing_db = editor.clone();
+    missing_db["database"] = json!(format!("my-ns/{ghost_db}"));
+    missing_db["connection_id"] = json!("quoting-editor-ghost");
+    for (conn, expected) in [
+        (
+            connection(&e, &format!("my-ns/{ghost_db}"), "quoting-ghost-db"),
+            format!("The database '{ghost_db}' does not exist"),
+        ),
+        (
+            missing_db,
+            format!("The database '{ghost_db}' does not exist"),
+        ),
+        (
+            connection(&e, &format!("{ghost_ns}/a b"), "quoting-ghost-ns"),
+            format!("The namespace '{ghost_ns}' does not exist"),
+        ),
+    ] {
+        let (_, message) = p
+            .call("test_connection", json!({ "params": conn }))
+            .unwrap_err();
+        assert!(
+            message.starts_with(&expected),
+            "{}: {message}",
+            conn["database"]
+        );
+    }
+    let my_ns = connection(&e, "my-ns", "quoting-ns");
+    assert!(defined(&mut p, &my_ns, "NS", "databases", "a b"));
+    assert!(!defined(&mut p, &my_ns, "NS", "databases", &ghost_db));
+    assert!(!defined(&mut p, &my_ns, "ROOT", "namespaces", &ghost_ns));
+    query(&mut p, &my_ns, "REMOVE NAMESPACE `my-ns`");
 }
 
 #[test]
