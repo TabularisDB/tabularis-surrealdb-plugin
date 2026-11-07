@@ -143,37 +143,57 @@ pub fn is_permission_denied(message: &str) -> bool {
 }
 
 /// The namespace or database to connect to does not exist. Worded like the
-/// server's own message, so [`with_hint`] adds the same hint to both.
+/// server's own message, so [`with_handshake_hint`] adds the same hint to
+/// both.
 pub fn not_found(
     kind: &str,
     name: &str,
     config: &SessionConfig,
     signed_in_as: AuthLevel,
 ) -> PluginError {
-    PluginError::internal(with_hint(
+    PluginError::internal(with_handshake_hint(
         &format!("The {kind} '{name}' does not exist"),
         config,
         signed_in_as,
     ))
 }
 
-/// Add a hint to a query or `use` failure when the cause is recognisable.
+/// Add a hint to a failure while connecting, after sign-in: checking and
+/// selecting the connection's namespace and database. A namespace or
+/// database that does not exist is then the connection's own, so the hint
+/// says where it is set. Other causes get the hints of [`with_hint`].
+pub fn with_handshake_hint(
+    message: &str,
+    config: &SessionConfig,
+    signed_in_as: AuthLevel,
+) -> String {
+    let lower = message.to_ascii_lowercase();
+    if !is_permission_denied(message) && lower.contains("does not exist") {
+        if lower.contains("namespace") {
+            return format!(
+                "{message}. Check the namespace of the connection's `namespace/database` (chosen in its Databases tab, or the path of its connection string). The plugin only connects to an existing namespace and never creates one."
+            );
+        }
+        if lower.contains("database") {
+            return format!(
+                "{message}. Check the database of the connection's `namespace/database` (chosen in its Databases tab, or the path of its connection string). The plugin only connects to an existing database and never creates one."
+            );
+        }
+    }
+    with_hint(message, config, signed_in_as)
+}
+
+/// Add a hint to a failed query or request when the cause is recognisable.
+/// A namespace or database that does not exist gets none: in a query typed
+/// in the editor (`REMOVE DATABASE ghost`) it is not the connection's. The
+/// connection's own are checked while connecting, see
+/// [`with_handshake_hint`].
 pub fn with_hint(message: &str, config: &SessionConfig, signed_in_as: AuthLevel) -> String {
     let lower = message.to_ascii_lowercase();
     if is_permission_denied(message) {
         return format!(
             "{message} (signed in as {}; this needs a user with more privileges, or a role such as EDITOR or OWNER)",
             level_description(signed_in_as, config)
-        );
-    }
-    if lower.contains("namespace") && lower.contains("does not exist") {
-        return format!(
-            "{message}. Check the namespace of the connection's `namespace/database` (chosen in its Databases tab, or the path of its connection string). The plugin only connects to an existing namespace and never creates one."
-        );
-    }
-    if lower.contains("database") && lower.contains("does not exist") {
-        return format!(
-            "{message}. Check the database of the connection's `namespace/database` (chosen in its Databases tab, or the path of its connection string). The plugin only connects to an existing database and never creates one."
         );
     }
     if lower.contains("specify a namespace") || lower.contains("specify a database") {
@@ -376,8 +396,8 @@ mod tests {
             ..config()
         };
         let messages = [
-            with_hint("The namespace 'nope' does not exist", &c, AuthLevel::Root),
-            with_hint("The database 'nope' does not exist", &c, AuthLevel::Root),
+            with_handshake_hint("The namespace 'nope' does not exist", &c, AuthLevel::Root),
+            with_handshake_hint("The database 'nope' does not exist", &c, AuthLevel::Root),
             with_hint("Specify a namespace to use", &c, AuthLevel::Root),
             auth_error(
                 &no_namespace,
@@ -404,7 +424,7 @@ mod tests {
             AuthLevel::Database,
         );
         assert!(perm.contains("signed in as database user `reader` on `app/main`"));
-        let ns = with_hint("The namespace 'nope' does not exist", &c, AuthLevel::Root);
+        let ns = with_handshake_hint("The namespace 'nope' does not exist", &c, AuthLevel::Root);
         assert!(ns.contains("Check the namespace"));
         assert!(ns.contains("never creates one"));
         let db = not_found("database", "ghost", &c, AuthLevel::Root);
@@ -417,5 +437,29 @@ mod tests {
         assert!(!is_permission_denied("The namespace 'x' does not exist"));
         let plain = with_hint("Parse error: unexpected token", &c, AuthLevel::Root);
         assert_eq!(plain, "Parse error: unexpected token");
+    }
+
+    #[test]
+    fn only_connecting_gets_the_not_found_hint() {
+        let c = config();
+        // A query typed in the editor names some other namespace or database.
+        for message in [
+            "The database 'ghost' does not exist",
+            "The namespace 'ghost' does not exist",
+        ] {
+            assert_eq!(with_hint(message, &c, AuthLevel::Root), message);
+            let connecting = with_handshake_hint(message, &c, AuthLevel::Root);
+            assert!(
+                connecting.starts_with(&format!("{message}. Check the ")),
+                "{connecting}"
+            );
+            assert!(connecting.contains("never creates one"), "{connecting}");
+        }
+        // Other causes get the same hints either way.
+        let perm = "IAM error: Not enough permissions to perform this action";
+        assert_eq!(
+            with_handshake_hint(perm, &c, AuthLevel::Database),
+            with_hint(perm, &c, AuthLevel::Database)
+        );
     }
 }

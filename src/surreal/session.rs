@@ -139,7 +139,7 @@ impl Session {
             {
                 return Ok(())
             }
-            Err(e) => return Err(self.rpc_error(e)),
+            Err(e) => return Err(self.handshake_error(e)),
         }
         if let Some(names) = self.info_names("INFO FOR NS", "databases").await? {
             if !names.contains(db) {
@@ -166,18 +166,23 @@ impl Session {
             {
                 return Ok(None)
             }
-            Err(e) => return Err(self.rpc_error(e)),
+            Err(e) => return Err(self.handshake_error(e)),
         };
-        listed_names(outcome, sql, key, &self.config.target())
-            .map_err(|m| PluginError::internal(self.hint(&m)))
+        listed_names(outcome, sql, key, &self.config.target()).map_err(|m| {
+            PluginError::internal(errors::with_handshake_hint(
+                &m,
+                &self.config,
+                self.signed_in_as,
+            ))
+        })
     }
 
     pub fn is_closed(&self) -> bool {
         self.client.is_closed()
     }
 
-    /// (Re)select the configured namespace and database.
-    pub async fn use_target(&self) -> Result<(), PluginError> {
+    /// Select the configured namespace and database.
+    async fn use_target(&self) -> Result<(), PluginError> {
         let ns = self
             .config
             .namespace
@@ -194,7 +199,7 @@ impl Session {
             .call("use", vec![ns, db])
             .await
             .map(|_| ())
-            .map_err(|e| self.rpc_error(e))
+            .map_err(|e| self.handshake_error(e))
     }
 
     /// Run SurrealQL and return one outcome per statement. Statement errors
@@ -269,6 +274,19 @@ impl Session {
     pub fn rpc_error(&self, error: RpcError) -> PluginError {
         match error {
             RpcError::Server(e) => PluginError::internal(self.hint(&e.message)),
+            other => PluginError::internal(other.to_string()),
+        }
+    }
+
+    /// Like [`Self::rpc_error`], for checking and selecting the namespace
+    /// and database while connecting ([`errors::with_handshake_hint`]).
+    fn handshake_error(&self, error: RpcError) -> PluginError {
+        match error {
+            RpcError::Server(e) => PluginError::internal(errors::with_handshake_hint(
+                &e.message,
+                &self.config,
+                self.signed_in_as,
+            )),
             other => PluginError::internal(other.to_string()),
         }
     }
