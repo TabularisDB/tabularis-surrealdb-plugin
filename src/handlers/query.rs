@@ -25,8 +25,8 @@ use crate::surreal::{retry_class, Retry};
 use crate::utils::pagination::{offset_for, slice_page};
 use crate::utils::surql::{
     can_push_down_pagination, cast_record_link_literals, compares_text_with_record_ids,
-    host_browse, is_balanced, normalize_host_browse_query, split_statements, with_pagination,
-    Statement,
+    contains_write, host_browse, is_balanced, normalize_host_browse_query, split_statements,
+    with_pagination, Statement,
 };
 use crate::utils::values::is_none;
 use ciborium::value::Value as Cbor;
@@ -156,10 +156,10 @@ impl Answers {
 
 /// Decide how to run `query` for page `page` of `limit` rows.
 ///
-/// Only single SELECT statements are paginated: the host re-runs the query
-/// for every page, which must never re-apply a write. A configured query
-/// timeout is added to pushed-down SELECTs as a `TIMEOUT` clause, so the
-/// server fails them when it expires.
+/// Only single SELECT statements that do not write are paginated: the host
+/// re-runs the query for every page, which must never re-apply a write. A
+/// configured query timeout is added to pushed-down SELECTs as a `TIMEOUT`
+/// clause, so the server fails them when it expires.
 pub fn plan(
     query: &str,
     limit: Option<u64>,
@@ -208,8 +208,12 @@ fn single_statement(
     timeout_secs: Option<u64>,
 ) -> (String, PageMode) {
     // A piece of a block the host's splitter cut is not a SELECT of its own,
-    // even when it starts with one.
-    let select = statement.first_keyword() == Some("SELECT") && is_balanced(statement.text);
+    // even when it starts with one. A SELECT with a write inside it
+    // (`SELECT * FROM (UPDATE …)`) would write again for every page, so it
+    // runs once, like any other write.
+    let select = statement.first_keyword() == Some("SELECT")
+        && is_balanced(statement.text)
+        && !contains_write(statement.text);
     match (select, limit) {
         (true, Some(size)) if can_push_down_pagination(statement) => {
             let offset = offset_for(page, size);
@@ -820,6 +824,46 @@ mod tests {
         let p = plan("USE NS x DB y; SELECT * FROM t", Some(10), 1, None).unwrap();
         assert!(p.uses_use);
         assert!(plan("  -- nothing\n ; ", Some(10), 1, None).is_err());
+    }
+
+    #[test]
+    fn never_paginates_selects_that_write() {
+        // The host runs the query again for every page.
+        for sql in [
+            "SELECT * FROM (UPDATE person SET n += 1)",
+            "SELECT * FROM UPDATE person SET n += 1",
+            "SELECT * FROM (UPDATE person SET n += 1) LIMIT 5",
+            "SELECT * FROM `person` WHERE (DELETE scratch) = []",
+        ] {
+            let p = plan(sql, Some(2), 2, Some(30)).unwrap();
+            assert_eq!(p.sql, sql);
+            assert_eq!(p.statements[0].mode, PageMode::None, "{sql}");
+            let q: Vec<String> = vec![sql.to_string()];
+            let (script, entries, _) = plan_batch(&q, Some(2), 2, Some(30));
+            assert_eq!(script, sql);
+            assert_eq!(entries[0].plans[0].mode, PageMode::None, "{sql}");
+        }
+        let r = respond(
+            vec![ok(records(3))],
+            &plan("SELECT * FROM (UPDATE t SET n += 1)", Some(2), 1, None)
+                .unwrap()
+                .statements,
+        )
+        .unwrap();
+        assert_eq!(r["rows"], json!([[0], [1], [2]]));
+        assert!(r["pagination"].is_null());
+        // A field, a function or an object key named like a write keyword.
+        let p = plan(
+            "SELECT array::insert(tags, 'x', 0) FROM t WHERE { update: 1 }.update = 1",
+            Some(2),
+            1,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            p.statements[0].mode,
+            PageMode::PushDown { page: 1, size: 2 }
+        );
     }
 
     #[test]

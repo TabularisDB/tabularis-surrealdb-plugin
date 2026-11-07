@@ -8,6 +8,8 @@
 //! - which keywords appear at the top level of a statement (to decide whether
 //!   `LIMIT … START …` can be appended for pagination),
 //! - the first keyword of a statement (SELECT, USE, …),
+//! - whether a statement has another one that writes inside it (a SELECT
+//!   that writes is run once, never paged),
 //! - which conditions of a table filter compare a column with text (to cast
 //!   record links).
 //!
@@ -135,6 +137,42 @@ pub fn can_push_down_pagination(statement: &Statement<'_>) -> bool {
         && !NO_PUSHDOWN_KEYWORDS
             .iter()
             .any(|k| statement.has_top_level_keyword(k))
+}
+
+/// Statements that change data or the schema.
+const WRITE_STATEMENT_KEYWORDS: &[&str] = &[
+    "CREATE", "INSERT", "UPDATE", "UPSERT", "DELETE", "RELATE", "DEFINE", "REMOVE", "ALTER",
+    "REBUILD",
+];
+
+/// True when `sql` contains a statement that writes, at any depth: in a
+/// subquery (`SELECT * FROM (UPDATE t SET n += 1)`), in a block
+/// (`{ CREATE t; RETURN [] }`), or after FROM without brackets
+/// (`SELECT * FROM UPDATE t SET …`), which 2.x and 3.x both run. SurrealQL
+/// reads these keywords as the start of a statement where an expression
+/// stands (`SELECT update FROM t` does not parse), so every one counts
+/// except a field path, parameter, record id or function name (`a.update`,
+/// `$update`, `array::insert`) and an object key (`{ update: 1 }`). The few
+/// places that take one as a name (`->update->`, `ORDER BY update`) count
+/// too, which only costs that query its paging.
+pub fn contains_write(sql: &str) -> bool {
+    let mut scanner = Scanner::new(sql);
+    while let Some(event) = scanner.next_event() {
+        let Event::Word(range) = event else {
+            continue;
+        };
+        let after = sql[range.end..].trim_start();
+        let object_key = after.starts_with(':') && !after.starts_with("::");
+        if !scanner.last_word_is_member()
+            && !object_key
+            && WRITE_STATEMENT_KEYWORDS
+                .iter()
+                .any(|k| sql[range.clone()].eq_ignore_ascii_case(k))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Append a pagination clause, and a `TIMEOUT` when one is configured (it
@@ -870,6 +908,37 @@ mod tests {
         // Pieces of a block the host's splitter cut.
         assert!(!check("SELECT * FROM item WHERE n >= $m }"));
         assert!(!check("SELECT * FROM { LET $a = 1"));
+    }
+
+    #[test]
+    fn finds_statements_that_write() {
+        for sql in [
+            "SELECT * FROM (UPDATE person SET n += 1)",
+            "SELECT * FROM UPDATE person SET n += 1",
+            "select * from (delete person:x)",
+            "SELECT * FROM person WHERE (CREATE scratch) != []",
+            "SELECT * FROM person WHERE id IN [RELATE person:a->knows->person:b]",
+            "SELECT * FROM (INSERT INTO t { n: 1 })",
+            "SELECT * FROM (UPSERT t:1 SET n = 1)",
+            "SELECT * FROM { DEFINE TABLE t; RETURN [] }",
+            "SELECT * FROM (REMOVE TABLE t)",
+            "SELECT * FROM (ALTER TABLE t COMMENT 'x')",
+            "SELECT * FROM (REBUILD INDEX i ON t)",
+            "SELECT * FROM (SELECT * FROM (UPDATE t SET n += 1) LIMIT 5)",
+        ] {
+            assert!(contains_write(sql), "{sql}");
+        }
+        for sql in [
+            "SELECT * FROM person WHERE status = 'update'",
+            "SELECT * FROM `update`, ⟨delete⟩ -- update",
+            "SELECT a.update, $delete FROM person:create",
+            "SELECT array::insert(tags, 'x', 0) FROM person",
+            "SELECT * FROM t WHERE { update: 1, delete : 2 }.update = 1",
+            "SELECT * FROM person WHERE name = /update/",
+            "SELECT ->knows->person AS friends FROM person",
+        ] {
+            assert!(!contains_write(sql), "{sql}");
+        }
     }
 
     #[test]
