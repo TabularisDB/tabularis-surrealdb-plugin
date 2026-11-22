@@ -8,6 +8,7 @@
   "engine": "surrealdb",
   "paradigms": ["document", "graph", "relational", "key-value", "vector"],
   "license": "Apache-2.0",
+  "icon": "https://raw.githubusercontent.com/TabularisDB/tabularis-surrealdb-plugin/main/surrealdb-icon.svg",
   "tags": ["surrealdb", "surrealql", "multi-model", "graph", "document"],
   "readme": "README.md",
   "support": {
